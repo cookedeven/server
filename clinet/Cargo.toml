@@ -1,0 +1,9 @@
+[package]
+name = "clinet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.44.1", features = ["rt", "rt-multi-thread", "macros", "net", "io-std", "io-util", "sync"] }
+anyhow = "1.0.97"
+uuid = { version = "1.16.0", features = ["v4"] }
