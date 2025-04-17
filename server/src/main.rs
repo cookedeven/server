@@ -1,5 +1,11 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{
+    fmt::{Display, Formatter},
+    error::Error,
+    collections::HashMap,
+    sync::Arc,
+    time::{SystemTime, Instant, Duration}
+};
+use std::io::Read;
 use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     io::{AsyncReadExt, AsyncWriteExt},
@@ -9,141 +15,129 @@ use tokio::{
 use uuid::Uuid;
 use lazy_static::lazy_static;
 
-type ShardState = Arc<Mutex<HashMap<String, String>>>;
+type ShardState = Arc<Mutex<HashMap<String, UpdateState>>>;
 
 const SERVER_IP: &'static str = "127.0.0.1:8080";
 
-lazy_static!{
-    static ref VEC_DB: Arc<Mutex<Vec<Uuid>>> = Arc::new(Mutex::new(Vec::new()));
+lazy_static! {
+    static ref VEC_DB: Arc<Mutex<Vec<(Uuid, String)>>> = Arc::new(Mutex::new(Vec::new()));
 }
 
-lazy_static!{
-    static ref HASHMAP_DB: Arc<Mutex<HashMap<String, Uuid>>> = Arc::new(Mutex::new(HashMap::new()));
+lazy_static! {
+    static ref ID_NAME: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 }
 
-lazy_static!{
+lazy_static! {
     static ref UID_UPDATE: ShardState = Arc::new(Mutex::new(HashMap::new()));
 }
 
-async fn handle_tcp_connection(mut stream: TcpStream) {
-    let mut buf = vec![0; 1024];
-    match stream.read(&mut buf).await {
-        Ok(n) if n > 0 => {
-            let msg = String::from_utf8_lossy(&buf[..n]);
-            println!("TCP 클라이언트 메시지: {}", msg);
+lazy_static! {
+    static ref ProgramTime: Instant = Instant::now();
+}
 
-            let response = format!("서버 응답 (TCP): {}", msg);
-            let _ = stream.write_all(response.as_bytes()).await;
+struct UpdateState {
+    state: String,
+    date: SystemTime,
+    duration: Duration,
+}
+
+impl UpdateState {
+    fn new(state: String, date: SystemTime, duration: Duration) -> Self {
+        Self { state, date, duration }
+    }
+}
+
+#[derive(Debug)]
+enum MessageError {
+    NotFound,
+    NotLongEnough,
+    CommandNotFound,
+    CommunicationError,
+    UndefinedError,
+}
+
+impl Error for MessageError {}
+
+impl Display for MessageError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "message not found"),
+            Self::NotLongEnough => write!(f, "message not long enough"),
+            Self::CommandNotFound => write!(f, "command not found"),
+            Self::CommunicationError => write!(f, "communication error"),
+            Self::UndefinedError => write!(f, "undefined error"),
+            _ => write!(f, "unknown error"),
         }
-        _ => println!("TCP 읽기 실패 또는 연결 종료"),
     }
 }
 
-async fn run_tcp_server() {
-    let listener = TcpListener::bind(SERVER_IP).await.unwrap();
-    println!("TCP 서버: {}", SERVER_IP);
-
-    loop {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let uid = Uuid::new_v4().to_string();
-
-        spawn(async move {
-            println!("새로운 클라이언트 UID: {}", uid);
-            let welcome = format!("WELCOME|UID:{}\n", uid);
-            let _ = socket.write_all(welcome.as_bytes()).await;
-            handle_tcp_connection(socket)
-        });
-    }
-}
-
-async fn run_udp_server() {
-    let socket = UdpSocket::bind(SERVER_IP).await.unwrap();
-    println!("UDP 서버: {}", SERVER_IP);
-
-    let mut buf = vec![0; 1024];
-    loop {
-        match socket.recv_from(&mut buf).await {
-            Ok((n, addr)) => {
-                let msg = String::from_utf8_lossy(&buf[..n]);
-                println!("UDP 메시지 from {}: {}", addr, msg);
-
-                let response = format!("서버 응답 (UDP): {}", msg);
-                let _ = socket.send_to(response.as_bytes(), addr).await;
+async fn tcp_new_uuid(message: &[u8], stream: &mut TcpStream) -> Result<(), MessageError> {
+    match message.get(1) {
+        Some(mode_2) => {
+            match mode_2 {
+                1 => {
+                    let id = message[2] as usize;
+                    if let Some((uuid, name)) = VEC_DB.lock().await.get(id) {
+                        let uuid_name_chain: Vec<u8> = uuid.as_bytes().into_iter().cloned().chain(name.as_bytes().iter().cloned()).collect();
+                        let _ = stream.write(&uuid_name_chain).await;
+                        Ok(())
+                    } else {
+                        let _ = stream.write(b"invalid id").await;
+                        Ok(())
+                    }
+                }
+                2 => {
+                    let new_name_len = message[2] as usize;
+                    let Some(new_name_utf8) = message.get(3..new_name_len + 3) else {
+                        return Err(MessageError::NotLongEnough)
+                    };
+                    let new_name = String::from_utf8_lossy(new_name_utf8).into_owned();
+                    let uuid = Uuid::new_v4();
+                    VEC_DB.lock().await.push((uuid, new_name));
+                    let _ = stream.write(uuid.as_bytes()).await;
+                    Ok(())
+                }
+                _ => Err(MessageError::CommandNotFound)
             }
-            Err(e) => eprintln!("UDP 수신 오류: {}", e),
         }
+        None => Err(MessageError::NotLongEnough)
     }
 }
 
-fn get_id(text: &str) -> usize {
-    let splits: Vec<&str> = text.splitn(2, ":").collect();
-    splits[1].trim().parse().unwrap()
+async fn tcp_connect_uuid(message: &[u8], stream: &mut TcpStream, state: &ShardState) -> Result<(), MessageError> {
+    let Some(uuid) = message.get(1..17) else {
+        return Err(MessageError::NotLongEnough)
+    };
+    let mut state = state.lock().await;
+    let key = String::from_utf8_lossy(uuid).into_owned();
+    if state.contains_key(&key) {
+        state.insert(String::from_utf8_lossy(uuid).into(), UpdateState::new("update!".into(), SystemTime::now(), ProgramTime.elapsed()));
+        let _ = stream.write(format!("connect to UID! name: ").as_bytes()).await;
+        Ok(())
+    } else {
+        let _ = stream.write(b"invalid UID").await;
+        Ok(())
+    }
 }
 
-fn get_name(text: &str) -> String {
-    String::new()
-}
-
-fn set_new_name(text: &str) -> String {
-    String::new()
-}
-
-async fn uuid_tcp_handle(mut stream: TcpStream, state: ShardState) {
+async fn async_uuid_tcp_handle<>(mut stream: TcpStream, state: ShardState) -> Result<(), MessageError> {
     let mut buffer = vec![0; 1024];
     if let Ok(size) = stream.read(&mut buffer).await {
-        let message = String::from_utf8_lossy(&buffer[..size]);
-        let trimmed = message.trim();
+        let message = &buffer[..size];
 
-        if trimmed.starts_with("REQUEST_UUID") {
-            let parts: Vec<&str> = trimmed.splitn(2, ".").collect();
-            let mut state = 0;
-            match parts[1] {
-                "ID_NUM" => state = 1,
-                "PLAYER_NAME" => state = 2,
-                "NEW" => state = 3,
-                _ => state = 4
-            }
-            match state {
-                0 => eprintln!("not set state!"),
-                1 => {
-                    let id = get_id(&parts[1]);
-                    if let Some(&uuid) = VEC_DB.lock().await.get(id) {
-                        let _ = stream.write(uuid.to_string().as_bytes());
-                    } else {
-                        let _ = stream.write(b"invalid id");
-                    }
-                },
-                2 => {
-                    let name = get_name(&parts[1]);
-                    if let Some(&uuid) = HASHMAP_DB.lock().await.get(&name) {
-                        let _ = stream.write(uuid.to_string().as_bytes());
-                    } else {
-                        let _ = stream.write(b"invalid name");
-                    }
-                },
-                3 => {
-                    let new_name = set_new_name(&parts[1]);
-                    let uuid = Uuid::new_v4();
-                    VEC_DB.lock().await.push(uuid);
-                    HASHMAP_DB.lock().await.insert(new_name, uuid);
-                    let _ = stream.write(uuid.to_string().as_bytes()).await;
+        match message.first() {
+            Some(mode_1) => {
+                match mode_1 {
+                    0 => Err(MessageError::NotFound),
+                    1 => tcp_new_uuid(&message, &mut stream).await,
+                    2 => tcp_connect_uuid(&message, &mut stream, &state).await,
+                    _ => Err(MessageError::CommandNotFound)
                 }
-                4 => eprintln!("invalid command! splits: {:?}", parts),
-                _ => eprintln!("invalid state!"),
             }
-        } else if trimmed.starts_with("CONNECT_UUID") {
-            let parts: Vec<&str> = trimmed.splitn(2, ".").collect();
-            let uuid = parts[1].trim();
-            let mut state = state.lock().await;
-            if state.contains_key(uuid) {
-                state.insert(uuid.to_string(), "updated".into());
-                let _ = stream.write(format!("connect to UID! name: {}", ).as_bytes());
-            } else {
-                let _ = stream.write(b"invalid UID");
-            }
-        } else {
-            eprintln!("invalid command! message: {}", message);
+            None => Err(MessageError::NotFound)
         }
+    } else {
+        Err(MessageError::CommunicationError)
     }
 }
 
@@ -157,12 +151,32 @@ async fn uuid_tcp_server() {
             Ok((stream, _addr)) => {
                 let state = Arc::clone(&state);
                 spawn(async move {
-                    uuid_tcp_handle(stream, state).await;
+                    let _ = async_uuid_tcp_handle(stream, state).await;
                 });
             }
-            Err(e) => {
-                eprintln!("Connection failed: {}", e);
+            Err(err) => {
+                eprintln!("Connection failed: {}", err);
             }
+        }
+    }
+}
+
+async fn uuid_udp_server() {
+    let socket = UdpSocket::bind(SERVER_IP).await.unwrap();
+    println!("UDP 서버! {}", SERVER_IP);
+
+    let mut buf = vec![0; 1024];
+    loop {
+        match socket.recv_from(&mut buf).await {
+            Ok((n, addr)) => {
+                let msg = String::from_utf8_lossy(&buf[..n]);
+
+                println!("UDP 메시지 form: {}: {}", addr, msg);
+
+                let response = format!("서버 응답 (UDP): {}", msg);
+                let _ = socket.send_to(response.as_bytes(), addr).await;
+            }
+            Err(e) => eprintln!("UDP 수신 오류: {}", e),
         }
     }
 }
