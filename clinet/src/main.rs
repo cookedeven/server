@@ -1,9 +1,16 @@
 use std::fmt::format;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use uuid::{Uuid, uuid};
+use uuid::{Uuid};
+use lazy_static::lazy_static;
 
 const SERVER_IP: &'static str = "127.0.0.1:8080";
+
+static CLIENT_ID: usize = 0;
+
+lazy_static! {
+    static ref CLIENT_UUID: Uuid = Uuid::nil();
+}
 
 async fn tcp_client() {
     match TcpStream::connect(SERVER_IP).await {
@@ -47,6 +54,19 @@ async fn uuid_tcp_client() {
     stream.write(msg.as_bytes()).await.unwrap();
     let size = stream.read(&mut buffer).await.unwrap();
     println!("Server connect: {}", String::from_utf8_lossy(&buffer[..size]));
+}
+
+async fn get_uuid(id: usize, stream: &mut TcpStream) -> Result<(), ()> {
+    let _ = stream.write_all(&id.to_le_bytes()).await;
+    todo!()
+}
+
+async fn async_tcp_client() -> Result<(), ()> {
+    let mut stream = TcpStream::connect(SERVER_IP).await.unwrap();
+    if CLIENT_UUID.is_nil() {
+        get_uuid(CLIENT_ID).await;
+    }
+    todo!()
 }
 
 #[tokio::main]
