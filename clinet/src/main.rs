@@ -6,7 +6,7 @@ use lazy_static::lazy_static;
 
 const SERVER_IP: &'static str = "127.0.0.1:8080";
 
-static CLIENT_ID: usize = 0;
+static mut CLIENT_ID: usize = 0;
 
 lazy_static! {
     static ref CLIENT_UUID: Uuid = Uuid::nil();
@@ -57,14 +57,30 @@ async fn uuid_tcp_client() {
 }
 
 async fn get_uuid(id: usize, stream: &mut TcpStream) -> Result<(), ()> {
-    let _ = stream.write_all(&id.to_le_bytes()).await;
+    let mut buffer = vec![0; 512];
+
+    let command: Vec<u8> = [1].to_vec();
+    let byte_id = id.to_le_bytes().to_vec();
+
+    let message_chain: Vec<_> = command.into_iter().chain(byte_id).collect();
+
+    let _ = stream.write_all(&message_chain).await;
+    match stream.read(&mut buffer).await {
+        Ok(size) => {
+            let message = &buffer[..size];
+        }
+        Err(err) => eprintln!("read error: {}", err)
+    }
     todo!()
 }
 
 async fn async_tcp_client() -> Result<(), ()> {
     let mut stream = TcpStream::connect(SERVER_IP).await.unwrap();
-    if CLIENT_UUID.is_nil() {
-        get_uuid(CLIENT_ID).await;
+    unsafe {
+        CLIENT_ID = 0;
+        if CLIENT_UUID.is_nil() {
+            let _ = get_uuid(CLIENT_ID, &mut stream).await;
+        }
     }
     todo!()
 }
