@@ -1,15 +1,23 @@
-use std::fmt::format;
-use tokio::net::{TcpStream, UdpSocket};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use uuid::{Uuid};
+use tokio::{
+    net::{TcpStream, UdpSocket},
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::OnceCell
+};
+use uuid::Uuid;
 use lazy_static::lazy_static;
-
-const SERVER_IP: &'static str = "127.0.0.1:8080";
-
-static mut CLIENT_ID: usize = 0;
+use libCode::{SERVER_IP};
 
 lazy_static! {
     static ref CLIENT_UUID: Uuid = Uuid::nil();
+    static ref CLIENT_ID: OnceCell<usize> = OnceCell::new();
+}
+
+struct PlayerStream {
+    tcp_stream: TcpStream,
+    uuid: Uuid,
+    name: String,
+    id: u32,
+    session_id: u32,
 }
 
 async fn tcp_client() {
@@ -40,7 +48,7 @@ async fn udp_client() {
     }
 }
 
-async fn uuid_tcp_client() {
+pub async fn uuid_tcp_client() {
     let mut stream = TcpStream::connect(SERVER_IP).await.unwrap();
 
     stream.write(b"REQUEST_UUID.NEW").await.unwrap();
@@ -74,18 +82,27 @@ async fn get_uuid(id: usize, stream: &mut TcpStream) -> Result<(), ()> {
     todo!()
 }
 
-async fn async_tcp_client() -> Result<(), ()> {
+pub async fn async_tcp_client() {
     let mut stream = TcpStream::connect(SERVER_IP).await.unwrap();
-    unsafe {
-        CLIENT_ID = 0;
-        if CLIENT_UUID.is_nil() {
-            let _ = get_uuid(CLIENT_ID, &mut stream).await;
-        }
-    }
-    todo!()
+    
 }
 
-#[tokio::main]
-async fn main() {
-    tokio::join!(uuid_tcp_client());
+pub async fn tcp() {
+    let mut stream = TcpStream::connect(SERVER_IP).await.unwrap();
+    let _ = stream.write_all(b"yay");
 }
+
+pub struct ServerHandle {
+    pub stream: TcpStream,
+}
+/*
+impl ServerHandle {
+    #[no_mangle]
+    pub extern "C" fn send_server(&mut self, message: *const c_char) -> c_int {
+        let a = message.to_string();
+        let _ = self.stream.write_all();
+        
+        0
+    }
+}
+*/
