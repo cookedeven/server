@@ -62,7 +62,11 @@ pub enum MessageError {
     CommunicationError,
     UndefinedError,
     TooLong,
-    OtherError(Box<dyn Error + Send + Sync>)
+    EmptyCommand,
+    InvalidUUID,
+    MissingUUID,
+    OtherError(Box<dyn Error + Send + Sync>),
+    FatalError(Box<dyn Error + Send + Sync>)
 }
 
 impl Error for MessageError {}
@@ -77,7 +81,7 @@ impl Display for MessageError {
             Self::TooLong => write!(f, "too long"),
             Self::UndefinedError => write!(f, "undefined error"),
             Self::OtherError(err) => write!(f, "{}", err),
-            _ => write!(f, "unknown error"),
+            _ => write!(f, "undefined unknown error"),
         }
     }
 }
