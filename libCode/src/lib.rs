@@ -78,12 +78,21 @@ impl Display for MessageError {
             Self::NotLongEnough => write!(f, "message not long enough"),
             Self::CommandNotFound => write!(f, "command not found"),
             Self::CommunicationError => write!(f, "communication error"),
-            Self::TooLong => write!(f, "too long"),
+            Self::TooLong => write!(f, "message too long"),
             Self::UndefinedError => write!(f, "undefined error"),
+            Self::EmptyCommand => write!(f, "empty command"),
+            Self::InvalidUUID => write!(f, "invalid UUID format"),
+            Self::MissingUUID => write!(f, "UUID is missing"),
             Self::OtherError(err) => write!(f, "{}", err),
+            Self::FatalError(err) => write!(f, "fatal error: {}", err),
             _ => write!(f, "undefined unknown error"),
         }
     }
+}
+
+pub enum QueueType {
+    Two,
+    Four
 }
 
 pub struct PlayerStream {

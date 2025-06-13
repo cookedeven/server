@@ -1,30 +1,29 @@
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering}
-    },
-    hash::Hash,
+    sync::Arc,
     collections::HashMap,
-    str::FromStr
+    str::{self, FromStr}
 };
 use std::error::Error;
-use std::f32::consts::E;
-use std::fmt::Display;
+use std::fmt::{Display, format};
 use tokio::{
     net::{TcpListener, TcpStream},
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, OnceCell},
+    sync::{
+        Mutex,
+    },
     spawn
 };
 use uuid::Uuid;
 use lazy_static::lazy_static;
-use tokio::io::{ReadHalf, split, WriteHalf};
-use tokio::sync::MutexGuard;
-use libCode::{MessageError, SERVER_IP};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use libCode::{MessageError, SERVER_IP, QueueType};
 
 type AM<T> = Arc<Mutex<T>>;
 type Name = String;
-type PlayerStream = (Uuid, Name);
+type PlayerInfo = (Uuid, Name);
+type PlayerQueue = (Uuid, Name, QueueType);
+type MessageSender = UnboundedSender<Message>;
+type MessageReceiver = UnboundedReceiver<Message>;
 
 macro_rules! am {
     ($t:expr) => {
@@ -34,18 +33,29 @@ macro_rules! am {
 
 lazy_static! {
     static ref PLAYER_TABLE: AM<HashMap<Uuid, AM<TcpStream>>> = am!(HashMap::new());
-    static ref MATCH_QUEUE_2: AM<Vec<[PlayerStream; 2]>> = am!(Vec::new());
-    static ref MATCH_QUEUE_4: AM<Vec<[PlayerStream; 4]>> = am!(Vec::new());
-    static ref PLAYER_DATA: AM<Vec<PlayerStream>> = am!(Vec::new());
-    static ref PLAYER_QUEUE: AM<Vec<AM<PlayerStream>>> = am!(Vec::new());
+    static ref MATCH_QUEUE_2: AM<Vec<[PlayerInfo; 2]>> = am!(Vec::new());
+    static ref MATCH_QUEUE_4: AM<Vec<[PlayerInfo; 4]>> = am!(Vec::new());
+    static ref PLAYER_DATA: AM<Vec<PlayerInfo>> = am!(Vec::new());
+    static ref PLAYER_QUEUE: AM<Vec<PlayerQueue>> = am!(Vec::new());
 }
 
 const COMMAND_POS: usize = 0;
 const UUID_POS: usize = 1;
-const ID_POS: usize = 1;
 const NAME_POS: usize = 1;
 const CONNECT_TYPE: usize = 2;
 const MATCH_COMMAND_POS: usize = 2;
+const MATCH_QUEUE_TYPE_POS: usize = 3;
+
+struct Message {
+    uuid: Uuid,
+    context: String
+}
+
+impl Message {
+    fn new(uuid: Uuid, context: String) -> Self {
+        Self { uuid, context }
+    }
+}
 
 fn search_id<T: PartialEq, U>(data: &[(T, U)], target: T) -> Option<usize> {
     data.iter().position(|(a, _)| *a == target)
@@ -80,20 +90,16 @@ async fn tcp_connect_uuid(message: &[&str], am_tcp_stream: AM<TcpStream>) -> Res
     };
     
     let _ = match message.get(CONNECT_TYPE) {
-        Some(&data) => {
-            match data { 
-                "MATCHING" => tcp_match(uuid, Arc::clone(&am_tcp_stream)).await,
-                _ => Err(MessageError::UndefinedError)
-            }
-        }
+        Some(&"MATCHING") => tcp_match(uuid, Arc::clone(&am_tcp_stream)).await,
+        Some(_) => Err(MessageError::UndefinedError),
         None => Err(MessageError::NotLongEnough)
     };
     
     println!("{}", message[2]);
-        let mut tcp_stream = am_tcp_stream.lock().await;
+    let mut tcp_stream = am_tcp_stream.lock().await;
     let data = &PLAYER_DATA.lock().await;
     
-    if let Some(_) = search_id(data, uuid){
+    if let Some(_) = search_id(data, uuid) {
         let _ = tcp_stream.write_all(format!("connect to UUID! uuid: {}", uuid).as_bytes()).await;
     } else {
         let _ = tcp_stream.write_all(b"invalid UUID").await;
@@ -101,18 +107,32 @@ async fn tcp_connect_uuid(message: &[&str], am_tcp_stream: AM<TcpStream>) -> Res
     Ok(())
 }
 
-async fn match_handle(message: &[&str], tcp_stream: AM<TcpStream>, uuid: Uuid, wait: &mut bool, playing: &mut bool) -> Result<(), MessageError> {
-    let player_queue = PLAYER_QUEUE.lock().await;
+async fn match_handle(message: &[&str], am_tcp_stream: AM<TcpStream>, uuid: Uuid, name: &Name, wait: &mut bool, playing: &mut bool) -> Result<(), MessageError> {
+    let mut player_queue = PLAYER_QUEUE.lock().await;
+    let mut tcp_stream = am_tcp_stream.lock().await;
+    
     match message.get(MATCH_COMMAND_POS) {
         Some(&"JOIN") => {
-            player_queue.push()
+            let queue_type = match message.get(MATCH_QUEUE_TYPE_POS) { 
+                Some(&"1vs1") => Ok(QueueType::Two),
+                Some(&"2vs2") => Ok(QueueType::Four),
+                Some(_) => Err(MessageError::CommandNotFound),
+                None => Err(MessageError::NotLongEnough)
+            }?;
+            player_queue.push((uuid, name.clone(), queue_type));
+            let _ = tcp_stream.write_all(format!("MATCH.JOIN.{}", uuid).as_bytes());
             *wait = true;
         }
         Some(&"LEAVE") => {
+            player_queue.retain(|(queue_uuid, _queue_name, _queue_type)| *queue_uuid != uuid);
+            let _ = tcp_stream.write_all(format!("MATCH.LEAVE.{}", uuid).as_bytes());
             *wait = false;
         }
-        Some(_) => {}
-        None => {}
+        Some(&other) if *playing => {
+            todo!()
+        }
+        Some(_) => return Err(MessageError::CommandNotFound),
+        None => return Err(MessageError::NotLongEnough)
     }
 
     Ok(())
@@ -120,29 +140,22 @@ async fn match_handle(message: &[&str], tcp_stream: AM<TcpStream>, uuid: Uuid, w
 
 async fn connect_handle(message: &[&str], am_tcp_stream: AM<TcpStream>) -> Result<(), MessageError> {
     match message.get(COMMAND_POS) {
-        Some(&command) => {
-            match command {
-                "END" => return Ok(()),
-                "CONNECT_UUID" => tcp_connect_uuid(&message, am_tcp_stream).await,
-                "RETURN" => {
-                    let mut tcp_stream = am_tcp_stream.lock().await;
-                    let _ = tcp_stream.write_all(b"RETURN").await;
-                    Ok(())
-                },
-                _ => Err(MessageError::CommandNotFound)
-            }
-        }
+        Some(&"END") => return Ok(()),
+        Some(&"UUID") => tcp_connect_uuid(&message, am_tcp_stream).await,
+        Some(_) => Err(MessageError::CommandNotFound),
         None => Err(MessageError::NotFound)
     }
 }
 
-async fn uuid_check(mut tcp_stream: TcpStream) -> Result<(AM<TcpStream>, Uuid), (MessageError, TcpStream)> {
-    let mut buffer = vec![0; 1024];
-    match tcp_stream.read(&mut buffer).await {
+async fn uuid_check(mut tcp_stream: TcpStream, buffer: &mut [u8]) -> Result<(AM<TcpStream>, Uuid), (MessageError, TcpStream)> {
+    match tcp_stream.read(buffer).await {
         Ok(size) => {
             let message = &buffer[..size];
-            let string_message = String::from_utf8_lossy(message);
-            let split_message: Vec<&str> = string_message.split(".").collect();
+            let str_message = match str::from_utf8(message) {
+                Ok(message) => message,
+                Err(err) => return Err((MessageError::OtherError(err.into()), tcp_stream))
+            };
+            let split_message: Vec<_> = str_message.split('.').collect();
 
             match split_message.get(COMMAND_POS) {
                 Some(&"NEW") => {
@@ -150,7 +163,7 @@ async fn uuid_check(mut tcp_stream: TcpStream) -> Result<(AM<TcpStream>, Uuid), 
                     let mut player_table = PLAYER_TABLE.lock().await;
                     let am_tcp_stream = am!(tcp_stream);
                     player_table.insert(uuid, Arc::clone(&am_tcp_stream));
-                    Ok((Arc::clone(&am_tcp_stream), uuid))
+                    Ok((am_tcp_stream, uuid))
                 }
                 Some(&"CONNECT") => {
                     let uuid_str = match split_message.get(UUID_POS) {
@@ -175,43 +188,66 @@ async fn uuid_check(mut tcp_stream: TcpStream) -> Result<(AM<TcpStream>, Uuid), 
     }
 }
 
-async fn loop_handle(tcp_stream: &mut TcpStream, am_tcp_stream: &AM<TcpStream>, buffer: &mut Vec<u8>, uuid: Uuid, wait: &mut bool, play: &mut bool) -> Result<(), MessageError> {
-    match tcp_stream.read(buffer).await {
+async fn name_check(am_tcp_stream: AM<TcpStream>, buffer: &mut [u8]) -> Result<Name, MessageError> {
+    let mut tcp_stream = am_tcp_stream.lock().await;
+    match tcp_stream.read(buffer).await { 
         Ok(size) => {
             let message = &buffer[..size];
-
-            let string_message = match String::from_utf8(message.into()) {
-                Ok(string_message) => string_message,
+            let str_message = match str::from_utf8(message) {
+                Ok(message) => message,
                 Err(err) => return Err(MessageError::OtherError(err.into()))
             };
-
-            let split_data: Vec<_> = string_message.split(".").collect();
-
-            println!("{:?}", split_data);
-
-            let Some(command) = split_data.get(COMMAND_POS).copied() else {
-                return Err(MessageError::NotFound)
-            };
-
-            match command {
-                "MATCH" => match_handle(&split_data, Arc::clone(am_tcp_stream), uuid, wait, play).await,
-                "CONNECT" => connect_handle(&split_data, Arc::clone(am_tcp_stream)).await,
-                _ => Err(MessageError::NotFound)
+            let split_message: Vec<_> = str_message.split('.').collect();
+            
+            let command = split_message.get(COMMAND_POS).copied().ok_or(MessageError::NotLongEnough)?;
+            if command != "NAME" {
+                return Err(MessageError::CommandNotFound);
             }
+            let name = split_message.get(NAME_POS).copied().ok_or(MessageError::NotLongEnough)?;
+            Ok(name.into())
         }
         Err(err) => Err(MessageError::OtherError(err.into()))
     }
 }
 
-async fn async_uuid_tcp_handle(tcp_stream: TcpStream) {
+async fn message_handle(am_tcp_stream: AM<TcpStream>, uuid: Uuid, name: &Name, wait_matching: &mut bool, play_matching: &mut bool, buffer: &mut [u8]) -> Result<(), Box<dyn Error>> {
+    let mut tcp_stream = am_tcp_stream.lock().await;
+    
+    let size = tcp_stream.read(buffer).await?;
+    
+    let message = &buffer[..size];
+    let string_message = String::from_utf8(message.to_vec())?;
+    let split_data: Vec<_> = string_message.split('.').collect();
+    println!("{:?}", split_data);
+    
+    match split_data.get(COMMAND_POS) {
+        Some(&"MATCH") => {
+            let _ = match_handle(&split_data, Arc::clone(&am_tcp_stream), uuid, name, wait_matching, play_matching).await;
+        }
+        Some(&"CONNECT") => {
+            let _ = connect_handle(&split_data, Arc::clone(&am_tcp_stream)).await;
+        }
+        Some(_) => {
+            eprintln!("command not found");
+        }
+        None => {
+            eprintln!("command missing");
+        }
+    }
+    Ok(())
+}
+
+async fn async_uuid_tcp_handle(am_tcp_stream: AM<TcpStream>, uuid: Uuid, tx_to_server: MessageSender, mut rx_from_server: MessageReceiver) {
     let mut buffer = vec![0; 1024];
     println!("new client!");
-
-    let (am_tcp_stream, uuid) = match uuid_check(tcp_stream).await {
-        Ok(am_tcp_stream) => am_tcp_stream,
-        Err((err, mut tcp_stream)) => {
+    
+    let name = match name_check(Arc::clone(&am_tcp_stream), &mut buffer).await {
+        Ok(name) => name,
+        Err(err) => {
             eprintln!("err: {}", err);
+            let mut tcp_stream = am_tcp_stream.lock().await;
             let _ = tcp_stream.write_all(format!("err: {}\n", err).as_bytes()).await;
+            let _ = tcp_stream.write_all(b"ConnectEnd").await;
             return;
         }
     };
@@ -221,10 +257,14 @@ async fn async_uuid_tcp_handle(tcp_stream: TcpStream) {
     let mut wait_matching = false;
     let mut play_matching = false;
     loop {
-        let result = loop_handle(&mut tcp_stream, &am_tcp_stream, &mut buffer, uuid, &mut wait_matching, &mut play_matching).await;
-        
-        if let Err(err) = result {
-            eprintln!("err: {}", err);
+        tokio::select! {
+            _ = async {
+                message_handle(Arc::clone(&am_tcp_stream), uuid, &name, &mut wait_matching, &mut play_matching, &mut buffer)
+            } => {}
+            
+            Some(msg) = rx_from_server.recv() => {
+                todo!()
+            }
         }
     }
 }
@@ -233,18 +273,39 @@ async fn read_uuid_from_stream<E: Error>(p0: &mut TcpStream) -> Result<Uuid, E> 
     todo!()
 }
 
-pub async fn uuid_tcp_server() {
-    let listener = TcpListener::bind(SERVER_IP).await.unwrap();
+pub async fn uuid_tcp_server(server_tx: MessageSender, client_senders: AM<HashMap<Uuid, MessageSender>>) {
+    let Ok(listener) = TcpListener::bind(SERVER_IP).await else {
+        panic!("cannot bind {}", SERVER_IP)
+    };
     println!("Server listening on {}", SERVER_IP);
 
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
+                let mut buffer = vec![0; 256];
+                let (am_tcp_stream, uuid) = match uuid_check(stream, &mut buffer).await {
+                    Ok(am_tcp_stream) => am_tcp_stream,
+                    Err((err, mut tcp_stream)) => {
+                        eprintln!("err: {}", err);
+                        let _ = tcp_stream.write_all(format!("err: {}\n", err).as_bytes()).await;
+                        let _ = tcp_stream.write_all(b"ConnectEnd").await;
+                        return;
+                    }
+                };
+                let server_tx_clone = server_tx.clone();
+                let (client_tx, client_rx) = unbounded_channel();
+                
                 spawn(async move {
-                    async_uuid_tcp_handle(stream).await
+                    async_uuid_tcp_handle(am_tcp_stream, uuid, server_tx_clone, client_rx).await
                 });
             }
             Err(err) => eprintln!("tcp server err: {}", err)
         }
+    }
+}
+
+pub async fn server_loop(mut rx_from_clients: MessageReceiver, client_senders: AM<HashMap<Uuid, MessageSender>>) {
+    loop {
+
     }
 }
