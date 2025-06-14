@@ -40,9 +40,11 @@ lazy_static! {
 }
 
 const COMMAND_POS: usize = 0;
+const SECOND_COMMAND_POST: usize = 1;
 const UUID_POS: usize = 1;
+const CONNECT_UUID_POS: usize = 2;
 const NAME_POS: usize = 1;
-const CONNECT_TYPE: usize = 2;
+const CONNECT_TYPE: usize = 3;
 const MATCH_COMMAND_POS: usize = 2;
 const MATCH_QUEUE_TYPE_POS: usize = 3;
 
@@ -79,7 +81,7 @@ async fn tcp_match(uuid: Uuid, am_tcp_stream: AM<TcpStream>) -> Result<(), Messa
 }
 
 async fn tcp_connect_uuid(message: &[&str], am_tcp_stream: AM<TcpStream>) -> Result<(), MessageError> {
-    let uuid_string = match message.get(UUID_POS) {
+    let uuid_string = match message.get(CONNECT_UUID_POS) {
         Some(uuid) => uuid,
         None => return Err(MessageError::NotLongEnough)
     };
@@ -139,7 +141,7 @@ async fn match_handle(message: &[&str], am_tcp_stream: AM<TcpStream>, uuid: Uuid
 }
 
 async fn connect_handle(message: &[&str], am_tcp_stream: AM<TcpStream>) -> Result<(), MessageError> {
-    match message.get(COMMAND_POS) {
+    match message.get(SECOND_COMMAND_POST) {
         Some(&"END") => return Ok(()),
         Some(&"UUID") => tcp_connect_uuid(&message, am_tcp_stream).await,
         Some(_) => Err(MessageError::CommandNotFound),

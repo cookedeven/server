@@ -1,0 +1,17 @@
+들여쓰기는 '.'으로 구분됨. 
+
+MATCH
+    JOIN
+        (UUID)
+            (NAME)
+    LEAVE
+        (UUID)
+CONNECT
+    END
+    UUID
+        (UUID)
+            (CONNECT_TYPE)
+NEW(첫 연결시 UUID 설정시)
+CONNECT(첫 연결시 UUID 설정시)
+    (UUID)
+NAME(첫 연결시 이름 설정시)
