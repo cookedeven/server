@@ -8,10 +8,11 @@ use tokio::{
     net::TcpStream,
     sync::Mutex
 };
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
 pub const SERVER_IP: &'static str = "127.0.0.1:8080";
-type ArcMutex<T> = Arc<Mutex<T>>;
+type AM<T> = Arc<Mutex<T>>;
 type Name = String;
 
 pub trait Log {}
@@ -98,4 +99,57 @@ pub enum QueueType {
 pub struct PlayerStream {
     pub tcp_stream: TcpStream,
     pub uuid: Uuid,
+}
+
+pub type ClientMessageSender = UnboundedSender<ClientMessage>;
+pub type ClientMessageReceiver = UnboundedReceiver<ClientMessage>;
+pub type ServerMessageSender = UnboundedSender<ServerMessage>;
+pub type ServerMessageReceiver = UnboundedReceiver<ServerMessage>;
+pub type ClientThreadMessageSender = UnboundedSender<ClientThreadMessage>;
+pub type ClientThreadMessageReceiver = UnboundedReceiver<ClientThreadMessage>;
+pub type ServerThreadMessageSender = UnboundedSender<ServerThreadMessage>;
+pub type ServerThreadMessageReceiver = UnboundedReceiver<ServerThreadMessage>;
+
+pub struct ClientMessage {
+    uuid: Uuid,
+    context: String
+}
+
+impl ClientMessage {
+    pub fn new(uuid: Uuid, context: String) -> Self {
+        Self { uuid, context }
+    }
+}
+
+pub struct ServerMessage {
+    uuid: Uuid,
+    context: String
+}
+
+impl ServerMessage {
+    pub fn new(uuid: Uuid, context: String) -> Self {
+        Self { uuid, context }
+    }
+}
+
+pub struct ClientThreadMessage {
+    uuid: Uuid,
+    context: String
+}
+
+impl ClientThreadMessage {
+    pub fn new(uuid: Uuid, context: String) -> Self {
+        Self { uuid, context }
+    }
+}
+
+pub struct ServerThreadMessage {
+    uuid: Uuid,
+    context: String
+}
+
+impl ServerThreadMessage {
+    pub fn new(uuid: Uuid, context: String) -> Self {
+        Self { uuid, context }
+    }
 }
