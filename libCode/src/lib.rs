@@ -66,6 +66,7 @@ pub enum MessageError {
     EmptyCommand,
     InvalidUUID,
     MissingUUID,
+    ParseError,
     OtherError(Box<dyn Error + Send + Sync>),
     FatalError(Box<dyn Error + Send + Sync>)
 }
