@@ -295,10 +295,9 @@ async fn async_uuid_tcp_handle(am_tcp_stream: AM<TcpStream>, uuid: Uuid, main_wr
     let mut state = State::default();
     
     loop {
-        tokio::select! {
-            _ = async {
-                message_handle(Arc::clone(&am_tcp_stream), uuid, &name, &mut state, &mut buffer)
-            } => {}
+        let result = message_handle(Arc::clone(&am_tcp_stream), uuid, &name, &mut state, &mut buffer).await;
+        if result.is_err() {
+            eprintln!("err!");
         }
     }
 }
