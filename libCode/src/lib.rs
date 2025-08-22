@@ -67,6 +67,10 @@ pub enum MessageError {
     InvalidUUID,
     MissingUUID,
     ParseError,
+    ConnectionClosed,
+    InvalidType,
+    InvalidUtf8(std::str::Utf8Error),
+    DeserializeError(serde_json::Error),
     OtherError(Box<dyn Error + Send + Sync>),
     FatalError(Box<dyn Error + Send + Sync>)
 }
