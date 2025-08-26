@@ -4,6 +4,8 @@ use std::{
     str::{self, FromStr},
     fs::File
 };
+use std::fmt::{write, Display, Formatter};
+use std::io::Read;
 use tokio::{
     net::{
         TcpListener,
@@ -32,6 +34,7 @@ pub type PlayerInfo = (Uuid, Name);
 pub type PlayerQueue = (Uuid, Name);
 pub type PlayerData = ARL<HashMap<Uuid, ARL<HashMap<String, Value>>>>;
 pub type SessionID = i64;
+pub type UserData = Map<String, Value>; // Map<Uuid, Map<DataName, Value>>
 
 #[macro_export]
 macro_rules! am {
@@ -59,25 +62,23 @@ struct TcpMessage {
     send_type: String,
     command: String,
     uuid: String,
-    send_data: Map<String, Value>,
-    request_data: Map<String, Value>
+    send_data: UserData,
+    request_data: UserData
 }
 
 #[derive(Default)]
-struct State {
-    matching: bool,
-    playing: bool
+struct UserState {
+    data: UserData,
+    uuid: Uuid,
+    matching_state: MatchingState
 }
 
-impl State {
-    fn matching_change(&mut self, matching: bool) {
-        self.matching = matching;
-    }
-    
-    fn playing_change(&mut self, playing: bool) {
-        self.playing = playing;
+impl UserState {
+    pub fn new(uuid: Uuid) -> Self {
+        Self { uuid, ..Default::default() }
     }
 }
+
 
 async fn read_data(read_half: &mut OwnedReadHalf, buffer: &mut [u8]) -> Result<TcpMessage, MessageError> {
     let size = read_half.read(buffer).await.map_err(|e| MessageError::OtherError(e.into()))?;
@@ -168,44 +169,58 @@ async fn name_check(read_half: &mut OwnedReadHalf, buffer: &mut [u8]) -> Result<
     }
 }
 
-fn send_data_handle(read_half: &mut OwnedReadHalf, write_half: &mut OwnedWriteHalf, send_data: Map<String, Value>, uuid: &Uuid, name: &Name, state: &mut State) {
+fn send_data_handle(read_half: &mut OwnedReadHalf, write_half: &mut OwnedWriteHalf, send_data: UserData, uuid: &Uuid, name: &Name, state: &mut UserState) -> Result<(), MessageError> {
     if send_data.is_empty() {
-        return;
+        return Ok(())
     }
-    
-    let data: Vec<_> = send_data.iter().map(|(k, v)| {
-        match k.as_str() {
-            "a" => "a",
-            _ => "b"
+
+    for (uuid, data_value) in send_data {
+        match data_value {
+            Value::String(data_name) => {
+                let _ = match data_name.as_str() {
+                    "into_matching" => {
+                        match state.matching_state {
+                            MatchingState::Nothing => state.matching_state = MatchingState::Matching,
+                            _ => continue
+                        }
+                    }
+                    "out_matching" => {
+                        match state.matching_state {
+                            MatchingState::Matching => state.matching_state = MatchingState::Nothing,
+                            _ => continue
+                        }
+                    }
+                    _ => continue
+                };
+            }
+            _ => return Err(MessageError::InvalidType)
         }
-    }).collect();
-    
+    }
+
+    Ok(())
 }
 
-fn request_data_handle(read_half: &mut OwnedReadHalf, write_half: &mut OwnedWriteHalf, request_data: Map<String, Value>, uuid: &Uuid, name: &Name, state: &mut State) {
+fn request_data_handle(read_half: &mut OwnedReadHalf, write_half: &mut OwnedWriteHalf, request_data: UserData, uuid: &Uuid, name: &Name, state: &mut UserState) -> Result<(), MessageError> {
     if request_data.is_empty() {
-        return;
+        return Ok(())
+    }
+
+    for (uuid, data_value) in &request_data {
+        match data_value {
+            Value::String(data_name) => {
+                let _ = match data_name.as_str() {
+                    "a" => "",
+                    _ => continue
+                };
+            }
+            _ => return Err(MessageError::InvalidType)
+        }
     }
     
-    let data: Vec<_> = request_data.iter().map(|(k, v)| { 
-        let target_= match Uuid::from_str(k) {
-            Ok(uuid) => uuid,
-            Err(_) => return Err(MessageError::InvalidUUID)
-        };
-        
-        match v {
-            Value::String(request) => {
-                match request.as_str() {
-                    "a" => Ok("1"),
-                    _ => Ok("2")
-                }
-            },
-            _ => Err(MessageError::InvalidType)
-        }
-    }).collect();
+    Ok(())
 }
 
-async fn message_handle(read_half: &mut OwnedReadHalf, write_half: &mut OwnedWriteHalf, uuid: Uuid, name: &Name, state: &mut State, buffer: &mut [u8]) -> Result<(), MessageError> {
+async fn message_handle(read_half: &mut OwnedReadHalf, write_half: &mut OwnedWriteHalf, uuid: Uuid, name: &Name, state: &mut UserState, buffer: &mut [u8]) -> Result<(), MessageError> {
     let tcp_message = match read_data(read_half, buffer).await {
         Ok(tcp_message) => tcp_message,
         Err(err) => return Err(err)
@@ -220,13 +235,12 @@ async fn message_handle(read_half: &mut OwnedReadHalf, write_half: &mut OwnedWri
     }
 }
 
-async fn async_uuid_tcp_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedWriteHalf>, uuid: Uuid, main_write: ClientThreadMessageSender, thread_read: ClientMessageReceiver) {
-    let mut buffer = vec![0; 1024];
+async fn async_uuid_tcp_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedWriteHalf>, uuid: Uuid, main_write: ClientThreadMessageSender, thread_read: ClientMessageReceiver, buffer: &mut [u8]) {
     println!("new client! uuid: {}", uuid);
     
     let mut read_half = am_read_half.lock().await;
     
-    let name = match name_check(&mut read_half, &mut buffer).await {
+    let name = match name_check(&mut read_half, buffer).await {
         Ok(name) => {
             println!("setting name: {}", name);
             let mut send_data = Map::new();
@@ -268,11 +282,11 @@ async fn async_uuid_tcp_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: A
         }
     };
     
-    let mut state = State::default();
+    let mut state = UserState::default();
     let mut write_half = am_write_half.lock().await;
     
     loop {
-        let result = message_handle(&mut read_half, &mut write_half, uuid, &name, &mut state, &mut buffer).await;
+        let result = message_handle(&mut read_half, &mut write_half, uuid, &name, &mut state, buffer).await;
         if result.is_err() {
             eprintln!("err!");
         }
@@ -294,15 +308,15 @@ pub async fn uuid_tcp_server(server_read: ClientMessageReceiver, server_write: S
                 println!("new client!!!!!!! addr: {}", addr);
                 let server_message = ServerMessage::new(Uuid::max(), format!("new client! addr: {}", addr));
                 let _ = server_write.send(server_message);
-                let mut buffer = vec![0; 512];
-                
+                let mut buffer = vec![0; 8192];
+
                 // Uuid 확인. 성공, 실패시 메시지 보냄.
                 let ((am_read_half, am_write_half), uuid) = match uuid_check(stream, &mut buffer).await {
                     Ok(((am_read_half, am_write_half), uuid)) => {
                         let mut write_half = am_write_half.lock().await;
-                        
+
                         println!("am tcp stream is ok!");
-                        
+
                         let tcp_message = TcpMessage {
                             send_type: "ok".to_string(),
                             command: "set_uuid".to_string(),
@@ -310,16 +324,16 @@ pub async fn uuid_tcp_server(server_read: ClientMessageReceiver, server_write: S
                             send_data: Map::new(),
                             request_data: Map::new()
                         };
-                        
+
                         send_tcp_message(&mut write_half, tcp_message).await;
-                        
+
                         drop(write_half);
-                        
+
                         ((am_read_half, am_write_half), uuid)
                     },
                     Err((err, _, mut write_half)) => {
                         eprintln!("err: {}", err);
-                        
+
                         let tcp_message = TcpMessage {
                             send_type: "error".to_string(),
                             command: "fatal".to_string(),
@@ -327,21 +341,21 @@ pub async fn uuid_tcp_server(server_read: ClientMessageReceiver, server_write: S
                             send_data: Map::new(),
                             request_data: Map::new()
                         };
-                        
+
                         send_tcp_message(&mut write_half, tcp_message).await;
-                        
+
                         return;
                     }
                 };
 
                 let (thread_write, thread_read) = unbounded_channel();
-                
+
                 thread_write_map.insert(uuid, thread_write);
 
                 let main_thread_write = main_thread_write.clone();
 
                 spawn(async move {
-                    async_uuid_tcp_handle(am_read_half, am_write_half, uuid, main_thread_write, thread_read).await
+                    async_uuid_tcp_handle(am_read_half, am_write_half, uuid, main_thread_write, thread_read, &mut buffer).await
                 });
             }
             Err(err) => eprintln!("tcp server err: {}", err)
@@ -355,4 +369,11 @@ pub async fn server_loop(mut clients_read: ServerMessageReceiver, client_write: 
     loop {
         tokio::task::yield_now().await;
     }
+}
+
+pub fn init(file: &mut File) -> Result<(), MessageError> {
+    let mut buffer = String::new();
+    file.read_to_string(&mut buffer)?;
+
+    Ok(())
 }

@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime}
 };
+use std::str::FromStr;
 use tokio::{
     net::TcpStream,
     sync::Mutex
@@ -96,6 +97,18 @@ impl Display for MessageError {
     }
 }
 
+impl From<std::io::Error> for MessageError {
+    fn from(value: std::io::Error) -> Self {
+        MessageError::OtherError(Box::new(value))
+    }
+}
+
+impl From<uuid::Error> for MessageError {
+    fn from(value: uuid::Error) -> Self {
+        MessageError::OtherError(value.into())
+    }
+}
+
 pub enum QueueType {
     Two,
     Four
@@ -156,5 +169,75 @@ pub struct ServerThreadMessage {
 impl ServerThreadMessage {
     pub fn new(uuid: Uuid, context: String) -> Self {
         Self { uuid, context }
+    }
+}
+
+#[derive(Default)]
+pub enum MatchingState {
+    #[default]
+    Nothing,
+    Matching,
+    Wait,
+    PlayWait,
+    Playing
+}
+
+impl FromStr for MatchingState {
+    type Err = MessageError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "nothing" => Ok(MatchingState::Nothing),
+            "matching" => Ok(MatchingState::Matching),
+            "wait" => Ok(MatchingState::Wait),
+            "play_wait" => Ok(MatchingState::PlayWait),
+            "playing" => Ok(MatchingState::Playing),
+            _ => Err(MessageError::NotFound)
+        }
+    }
+}
+
+impl Display for MatchingState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}",
+            match self {
+                MatchingState::Nothing => "nothing",
+                MatchingState::Matching => "matching",
+                MatchingState::Wait => "wait",
+                MatchingState::PlayWait => "play_wait",
+                MatchingState::Playing => "playing",
+            }
+        )
+    }
+}
+
+pub enum ErrorLevel {
+    Fatal,
+    Warning,
+    Ok
+}
+
+impl FromStr for ErrorLevel {
+    type Err = MessageError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "fatal" => Ok(ErrorLevel::Fatal),
+            "warning" => Ok(ErrorLevel::Warning),
+            "ok" => Ok(ErrorLevel::Ok),
+            _ => Err(MessageError::NotFound)
+        }
+    }
+}
+
+impl Display for ErrorLevel {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}",
+            match self {
+                ErrorLevel::Fatal => "fatal",
+                ErrorLevel::Warning => "warning",
+                ErrorLevel::Ok => "ok"
+            }
+        )
     }
 }
