@@ -2,15 +2,16 @@ use std::{
     error::Error,
     fmt::{Display, Formatter},
     sync::Arc,
-    time::{Duration, SystemTime}
+    time::{Duration, SystemTime},
+    str::FromStr
 };
-use std::str::FromStr;
 use tokio::{
     net::TcpStream,
-    sync::Mutex
+    sync::{Mutex, mpsc::{UnboundedReceiver, UnboundedSender}},
 };
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 pub const SERVER_IP: &'static str = "127.0.0.1:8080";
 type AM<T> = Arc<Mutex<T>>;
@@ -172,7 +173,18 @@ impl ServerThreadMessage {
     }
 }
 
-#[derive(Default)]
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TcpMessage {
+    pub send_type: String,
+    pub command: String,
+    pub uuid: String,
+    pub send_data: UserData,
+    pub request_data: UserData
+}
+
+pub type UserData = Map<String, Value>; // Map<Uuid, Map<DataName, Value>>
+
+#[derive(Default, Eq, PartialEq)]
 pub enum MatchingState {
     #[default]
     Nothing,

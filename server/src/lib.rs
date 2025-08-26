@@ -16,7 +16,8 @@ use tokio::{
     sync::{
         Mutex,
         RwLock,
-        mpsc::unbounded_channel
+        broadcast,
+        mpsc::{UnboundedSender, UnboundedReceiver, unbounded_channel}
     },
     spawn
 };
@@ -34,7 +35,6 @@ pub type PlayerInfo = (Uuid, Name);
 pub type PlayerQueue = (Uuid, Name);
 pub type PlayerData = ARL<HashMap<Uuid, ARL<HashMap<String, Value>>>>;
 pub type SessionID = i64;
-pub type UserData = Map<String, Value>; // Map<Uuid, Map<DataName, Value>>
 
 #[macro_export]
 macro_rules! am {
@@ -57,15 +57,6 @@ lazy_static! {
     static ref USER_SESSION_DATA: ARL<HashMap<SessionID, PlayerData>> = arl!(HashMap::new());
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct TcpMessage {
-    send_type: String,
-    command: String,
-    uuid: String,
-    send_data: UserData,
-    request_data: UserData
-}
-
 #[derive(Default)]
 struct UserState {
     data: UserData,
@@ -79,13 +70,18 @@ impl UserState {
     }
 }
 
+enum ThreadMessage {
+    String(String),
+    UserSate(UserState),
+    PlayerUnboundedReceiver(AM<UnboundedReceiver<PlayerData>>),
+}
 
 async fn read_data(read_half: &mut OwnedReadHalf, buffer: &mut [u8]) -> Result<TcpMessage, MessageError> {
     let size = read_half.read(buffer).await.map_err(|e| MessageError::OtherError(e.into()))?;
     if size == 0 {
         return Err(MessageError::ConnectionClosed);
     }
-    
+
     let size = match read_half.read(buffer).await {
         Ok(size) => size,
         Err(err) => return Err(MessageError::OtherError(err.into()))
@@ -235,7 +231,7 @@ async fn message_handle(read_half: &mut OwnedReadHalf, write_half: &mut OwnedWri
     }
 }
 
-async fn async_uuid_tcp_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedWriteHalf>, uuid: Uuid, main_write: ClientThreadMessageSender, thread_read: ClientMessageReceiver, buffer: &mut [u8]) {
+async fn async_uuid_tcp_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedWriteHalf>, uuid: Uuid, main_write: UnboundedSender<ThreadMessage>, thread_read: UnboundedReceiver<ThreadMessage>, buffer: &mut [u8]) {
     println!("new client! uuid: {}", uuid);
     
     let mut read_half = am_read_half.lock().await;
@@ -293,7 +289,7 @@ async fn async_uuid_tcp_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: A
     }
 }
 
-pub async fn uuid_tcp_server(server_read: ClientMessageReceiver, server_write: ServerMessageSender) {
+pub async fn uuid_tcp_server(mut server_read: UnboundedReceiver<ThreadMessage>, server_write: UnboundedSender<ThreadMessage>) {
     let Ok(listener) = TcpListener::bind(SERVER_IP).await else {
         panic!("cannot bind {}", SERVER_IP)
     };
@@ -302,72 +298,109 @@ pub async fn uuid_tcp_server(server_read: ClientMessageReceiver, server_write: S
     let (main_thread_write, mut main_thread_read) = unbounded_channel();
     let thread_write_map = Arc::new(DashMap::new());
 
-    loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                println!("new client!!!!!!! addr: {}", addr);
-                let server_message = ServerMessage::new(Uuid::max(), format!("new client! addr: {}", addr));
-                let _ = server_write.send(server_message);
-                let mut buffer = vec![0; 8192];
+    spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, addr)) => {
+                    println!("new client!!!!!!! addr: {}", addr);
+                    let server_message = ThreadMessage::String("New Client!".to_string());
+                    let _ = server_write.send(server_message);
+                    let mut buffer = vec![0; 8192];
 
-                // Uuid 확인. 성공, 실패시 메시지 보냄.
-                let ((am_read_half, am_write_half), uuid) = match uuid_check(stream, &mut buffer).await {
-                    Ok(((am_read_half, am_write_half), uuid)) => {
-                        let mut write_half = am_write_half.lock().await;
+                    // Uuid 확인. 성공, 실패시 메시지 보냄.
+                    let ((am_read_half, am_write_half), uuid) = match uuid_check(stream, &mut buffer).await {
+                        Ok(((am_read_half, am_write_half), uuid)) => {
+                            let mut write_half = am_write_half.lock().await;
 
-                        println!("am tcp stream is ok!");
+                            println!("am tcp stream is ok!");
 
-                        let tcp_message = TcpMessage {
-                            send_type: "ok".to_string(),
-                            command: "set_uuid".to_string(),
-                            uuid: uuid.to_string(),
-                            send_data: Map::new(),
-                            request_data: Map::new()
-                        };
+                            let tcp_message = TcpMessage {
+                                send_type: "ok".to_string(),
+                                command: "set_uuid".to_string(),
+                                uuid: uuid.to_string(),
+                                send_data: Map::new(),
+                                request_data: Map::new()
+                            };
 
-                        send_tcp_message(&mut write_half, tcp_message).await;
+                            send_tcp_message(&mut write_half, tcp_message).await;
 
-                        drop(write_half);
+                            drop(write_half);
 
-                        ((am_read_half, am_write_half), uuid)
-                    },
-                    Err((err, _, mut write_half)) => {
-                        eprintln!("err: {}", err);
+                            ((am_read_half, am_write_half), uuid)
+                        },
+                        Err((err, _, mut write_half)) => {
+                            eprintln!("err: {}", err);
 
-                        let tcp_message = TcpMessage {
-                            send_type: "error".to_string(),
-                            command: "fatal".to_string(),
-                            uuid: String::new(),
-                            send_data: Map::new(),
-                            request_data: Map::new()
-                        };
+                            let tcp_message = TcpMessage {
+                                send_type: "error".to_string(),
+                                command: "fatal".to_string(),
+                                uuid: String::new(),
+                                send_data: Map::new(),
+                                request_data: Map::new()
+                            };
 
-                        send_tcp_message(&mut write_half, tcp_message).await;
+                            send_tcp_message(&mut write_half, tcp_message).await;
 
-                        return;
-                    }
+                            return;
+                        }
+                    };
+
+                    let (thread_write, thread_read) = unbounded_channel();
+
+                    thread_write_map.insert(uuid, thread_write);
+
+                    let main_thread_write = main_thread_write.clone();
+
+                    spawn(async move {
+                        async_uuid_tcp_handle(am_read_half, am_write_half, uuid, main_thread_write, thread_read, &mut buffer).await
+                    });
+                }
+                Err(err) => eprintln!("tcp server err: {}", err)
+            }
+        }
+    });
+
+    spawn(
+        async move {
+            loop {
+                let Some(read) = server_read.recv().await else {
+                    continue
                 };
 
-                let (thread_write, thread_read) = unbounded_channel();
 
-                thread_write_map.insert(uuid, thread_write);
-
-                let main_thread_write = main_thread_write.clone();
-
-                spawn(async move {
-                    async_uuid_tcp_handle(am_read_half, am_write_half, uuid, main_thread_write, thread_read, &mut buffer).await
-                });
             }
-            Err(err) => eprintln!("tcp server err: {}", err)
         }
-    }
+    );
 }
 
-pub async fn server_loop(mut clients_read: ServerMessageReceiver, client_write: ClientMessageSender) {
+pub async fn server_loop(mut clients_read: UnboundedReceiver<ThreadMessage>, client_write: UnboundedSender<ThreadMessage>) {
     // let (main_thread_write, mut main_thread_read) = unbounded_channel();
     // let thread_write_map = Arc::new(DashMap::new());
     loop {
-        tokio::task::yield_now().await;
+        let Some(read) = clients_read.recv().await else {
+            continue
+        };
+
+        match read {
+            ThreadMessage::String(message) => {
+                match message.as_str() {
+                    "New Client!" => {
+                        spawn(async move {
+                            
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            ThreadMessage::UserSate(user_sate) => {
+                if user_sate.matching_state == MatchingState::Matching {
+                    
+                }
+            }
+            ThreadMessage::PlayerUnboundedReceiver(am_client_read) => {
+
+            }
+        }
     }
 }
 
