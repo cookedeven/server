@@ -73,8 +73,36 @@ pub enum MessageError {
     InvalidType,
     InvalidUtf8(std::str::Utf8Error),
     DeserializeError(serde_json::Error),
+    Errors(Vec<Box<Self>>),
     OtherError(Box<dyn Error + Send + Sync>),
     FatalError(Box<dyn Error + Send + Sync>)
+}
+
+impl MessageError {
+    pub fn unrecoverable_error(&self) -> bool {
+        match self {
+            MessageError::NotFound => false,
+            MessageError::NotLongEnough => false,
+            MessageError::CommandNotFound => false,
+            MessageError::CommunicationError => false,
+            MessageError::UndefinedError => true,
+            MessageError::TooLong => false,
+            MessageError::EmptyCommand => false,
+            MessageError::InvalidUUID => false,
+            MessageError::MissingUUID => true,
+            MessageError::ParseError => false,
+            MessageError::ConnectionClosed => true,
+            MessageError::InvalidType => false,
+            MessageError::InvalidUtf8(_) => false,
+            MessageError::DeserializeError(_) => false,
+            MessageError::Errors(errors) => {
+                errors.iter().any(|e| e.unrecoverable_error())
+            }
+            MessageError::OtherError(_) => false,
+            MessageError::FatalError(_) => true,
+            _ => false
+        }
+    }
 }
 
 impl Error for MessageError {}
@@ -187,6 +215,7 @@ pub type UserData = Map<String, Value>; // Map<Uuid, Map<DataName, Value>>
 #[derive(Default, Eq, PartialEq)]
 pub enum MatchingState {
     #[default]
+    None,
     Nothing,
     Matching,
     Wait,
@@ -199,11 +228,11 @@ impl FromStr for MatchingState {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "nothing" => Ok(MatchingState::Nothing),
-            "matching" => Ok(MatchingState::Matching),
-            "wait" => Ok(MatchingState::Wait),
-            "play_wait" => Ok(MatchingState::PlayWait),
-            "playing" => Ok(MatchingState::Playing),
+            "nothing" => Ok(Self::Nothing),
+            "matching" => Ok(Self::Matching),
+            "wait" => Ok(Self::Wait),
+            "play_wait" => Ok(Self::PlayWait),
+            "playing" => Ok(Self::Playing),
             _ => Err(MessageError::NotFound)
         }
     }
@@ -213,11 +242,12 @@ impl Display for MatchingState {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}",
             match self {
-                MatchingState::Nothing => "nothing",
-                MatchingState::Matching => "matching",
-                MatchingState::Wait => "wait",
-                MatchingState::PlayWait => "play_wait",
-                MatchingState::Playing => "playing",
+                Self::None => "none",
+                Self::Nothing => "nothing",
+                Self::Matching => "matching",
+                Self::Wait => "wait",
+                Self::PlayWait => "play_wait",
+                Self::Playing => "playing",
             }
         )
     }
@@ -234,9 +264,9 @@ impl FromStr for ErrorLevel {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "fatal" => Ok(ErrorLevel::Fatal),
-            "warning" => Ok(ErrorLevel::Warning),
-            "ok" => Ok(ErrorLevel::Ok),
+            "fatal" => Ok(Self::Fatal),
+            "warning" => Ok(Self::Warning),
+            "ok" => Ok(Self::Ok),
             _ => Err(MessageError::NotFound)
         }
     }
@@ -246,9 +276,9 @@ impl Display for ErrorLevel {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}",
             match self {
-                ErrorLevel::Fatal => "fatal",
-                ErrorLevel::Warning => "warning",
-                ErrorLevel::Ok => "ok"
+                Self::Fatal => "fatal",
+                Self::Warning => "warning",
+                Self::Ok => "ok"
             }
         )
     }

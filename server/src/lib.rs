@@ -1,11 +1,10 @@
 use std::{
     sync::Arc,
-    collections::HashMap,
+    collections::HashSet,
     str::{self, FromStr},
-    fs::File
+    fs::File,
+    io::Read, panic
 };
-use std::fmt::{write, Display, Formatter};
-use std::io::Read;
 use tokio::{
     net::{
         TcpListener,
@@ -19,13 +18,15 @@ use tokio::{
         broadcast,
         mpsc::{UnboundedSender, UnboundedReceiver, unbounded_channel}
     },
-    spawn
+    spawn,
+    task::JoinSet
 };
-use uuid::Uuid;
+use uuid::{uuid, Uuid};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, Map, json, to_vec};
 use dashmap::DashMap;
+use futures::stream::{FuturesUnordered, StreamExt};
 use libCode::*;
 
 pub type AM<T> = Arc<Mutex<T>>;
@@ -33,7 +34,7 @@ pub type ARL<T> = Arc<RwLock<T>>;
 pub type Name = String;
 pub type PlayerInfo = (Uuid, Name);
 pub type PlayerQueue = (Uuid, Name);
-pub type PlayerData = ARL<HashMap<Uuid, ARL<HashMap<String, Value>>>>;
+pub type PlayerData = Arc<DashMap<Uuid, Arc<DashMap<String, Value>>>>;
 pub type SessionID = i64;
 
 #[macro_export]
@@ -51,10 +52,10 @@ macro_rules! arl {
 }
 
 lazy_static! {
-    static ref PLAYER_TABLE: AM<HashMap<Uuid, (AM<OwnedReadHalf>, AM<OwnedWriteHalf>)>> = am!(HashMap::new());
-    static ref DATA_FILE: AM<File> = am!(File::open("./data.txt").expect("Failed to open file"));
-    static ref USER_DATA: PlayerData = arl!(HashMap::new());
-    static ref USER_SESSION_DATA: ARL<HashMap<SessionID, PlayerData>> = arl!(HashMap::new());
+    static ref PLAYER_TABLE: Arc<DashMap<Uuid, (AM<OwnedReadHalf>, AM<OwnedWriteHalf>)>> = Arc::new(DashMap::new());
+    static ref USER_DATA: PlayerData = Arc::new(DashMap::new());
+    static ref USER_SESSION_DATA: Arc<DashMap<SessionID, PlayerData>> = Arc::new(DashMap::new());
+    static ref USER_UNBOUNDED_SENDERS: Arc<DashMap<Uuid, UnboundedSender<PlayerData>>> = Arc::new(DashMap::new());
 }
 
 #[derive(Default)]
@@ -70,10 +71,32 @@ impl UserState {
     }
 }
 
-enum ThreadMessage {
+struct ThreadUnboundedSenders {
+    senders: Arc<DashMap<Uuid, UnboundedSender<PlayerData>>>,
+}
+
+impl ThreadUnboundedSenders {
+    fn new() -> Self {
+        let senders = Arc::new(DashMap::new());
+        Self { senders }
+    }
+
+    fn add_sender(&mut self, uuid: Uuid, sender: UnboundedSender<PlayerData>) {
+        self.senders.insert(uuid, sender);
+    }
+
+    fn remove_sender(&mut self, uuid: &Uuid) {
+        self.senders.remove(uuid);
+    }
+}
+
+pub enum ThreadMessage {
     String(String),
+    Uuid(Uuid),
+    TaskEnd(Uuid),
     UserSate(UserState),
-    PlayerUnboundedReceiver(AM<UnboundedReceiver<PlayerData>>),
+    ThreadSenders(ThreadUnboundedSenders),
+    AnyData(Arc<dyn Send + Sync>)
 }
 
 async fn read_data(read_half: &mut OwnedReadHalf, buffer: &mut [u8]) -> Result<TcpMessage, MessageError> {
@@ -122,7 +145,7 @@ async fn uuid_check(tcp_stream: TcpStream, buffer: &mut [u8]) -> Result<((AM<Own
         match tcp_message.command.as_str() {
             "get" => {
                 let uuid = Uuid::new_v4();
-                let mut player_table = PLAYER_TABLE.lock().await;
+                let mut player_table = &PLAYER_TABLE;
                 let am_read_write_half = (am!(read_half), am!(write_half));
                 player_table.insert(uuid, am_read_write_half.clone());
                 Ok((am_read_write_half, uuid))
@@ -132,7 +155,7 @@ async fn uuid_check(tcp_stream: TcpStream, buffer: &mut [u8]) -> Result<((AM<Own
                     Ok(uuid) => uuid,
                     Err(_) => return Err((MessageError::InvalidUUID, read_half, write_half)),
                 };
-                let player_table = PLAYER_TABLE.lock().await;
+                let player_table = &PLAYER_TABLE;
                 match player_table.get(&uuid) {
                     Some(stream) => Ok((stream.clone(), uuid)),
                     None => Err((MessageError::NotFound, read_half, write_half))
@@ -223,20 +246,26 @@ async fn message_handle(read_half: &mut OwnedReadHalf, write_half: &mut OwnedWri
     };
 
     if tcp_message.send_type.as_str() == "connect" {
-        send_data_handle(read_half, write_half, tcp_message.send_data, &uuid, name, state);
-        request_data_handle(read_half, write_half, tcp_message.request_data, &uuid, name, state);
-        Ok(())
+        let send_data_result = send_data_handle(read_half, write_half, tcp_message.send_data, &uuid, name, state);
+        let request_data_result = request_data_handle(read_half, write_half, tcp_message.request_data, &uuid, name, state);
+
+        match (send_data_result, request_data_result) {
+            (Ok(_), Ok(_)) => Ok(()),
+            (Err(e1), Ok(_)) => Err(e1),
+            (Ok(_), Err(e2)) => Err(e2),
+            (Err(e1), Err(e2)) => Err(MessageError::Errors(vec![Box::new(e1), Box::new(e2)])),
+        }
     } else { 
         Err(MessageError::NotFound)
     }
 }
 
-async fn async_uuid_tcp_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedWriteHalf>, uuid: Uuid, main_write: UnboundedSender<ThreadMessage>, thread_read: UnboundedReceiver<ThreadMessage>, buffer: &mut [u8]) {
+async fn async_uuid_tcp_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedWriteHalf>, uuid: Uuid, main_write: UnboundedSender<ThreadMessage>, thread_read: UnboundedReceiver<ThreadMessage>, mut buffer: Vec<u8>, thread_senders: Arc<DashMap<Uuid, UnboundedSender<ThreadMessage>>>) -> Uuid {
     println!("new client! uuid: {}", uuid);
     
     let mut read_half = am_read_half.lock().await;
     
-    let name = match name_check(&mut read_half, buffer).await {
+    let name = match name_check(&mut read_half, &mut buffer).await {
         Ok(name) => {
             println!("setting name: {}", name);
             let mut send_data = Map::new();
@@ -274,6 +303,7 @@ async fn async_uuid_tcp_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: A
             
             let mut write_half = am_write_half.lock().await;
             send_tcp_message(&mut write_half, tcp_message).await;
+
             String::new()
         }
     };
@@ -282,11 +312,17 @@ async fn async_uuid_tcp_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: A
     let mut write_half = am_write_half.lock().await;
     
     loop {
-        let result = message_handle(&mut read_half, &mut write_half, uuid, &name, &mut state, buffer).await;
-        if result.is_err() {
-            eprintln!("err!");
+        let result = message_handle(&mut read_half, &mut write_half, uuid, &name, &mut state, &mut buffer).await;
+        if let Err(error) = result {
+           if error.unrecoverable_error() {
+               return uuid
+           }
         }
     }
+}
+
+pub async fn user_manager() {
+
 }
 
 pub async fn uuid_tcp_server(mut server_read: UnboundedReceiver<ThreadMessage>, server_write: UnboundedSender<ThreadMessage>) {
@@ -296,7 +332,8 @@ pub async fn uuid_tcp_server(mut server_read: UnboundedReceiver<ThreadMessage>, 
     println!("Server listening on {}", SERVER_IP);
 
     let (main_thread_write, mut main_thread_read) = unbounded_channel();
-    let thread_write_map = Arc::new(DashMap::new());
+    let mut thread_write_map = Arc::new(DashMap::new());
+    let mut tasks = JoinSet::new();
 
     spawn(async move {
         loop {
@@ -345,17 +382,35 @@ pub async fn uuid_tcp_server(mut server_read: UnboundedReceiver<ThreadMessage>, 
                         }
                     };
 
+                    let _ = server_write.send(ThreadMessage::Uuid(uuid));
+
+                    // 스레드 채널 생성
                     let (thread_write, thread_read) = unbounded_channel();
-
+                    // 스레드 채널 추가
                     thread_write_map.insert(uuid, thread_write);
-
+                    // 메인 채널 복사
                     let main_thread_write = main_thread_write.clone();
+                    // 스레드 채널 참조 복사
+                    let thread_write_map_clone = thread_write_map.clone();
 
-                    spawn(async move {
-                        async_uuid_tcp_handle(am_read_half, am_write_half, uuid, main_thread_write, thread_read, &mut buffer).await
+                    tasks.spawn(async move {
+                        async_uuid_tcp_handle(am_read_half, am_write_half, uuid, main_thread_write, thread_read, buffer, thread_write_map_clone).await
                     });
                 }
                 Err(err) => eprintln!("tcp server err: {}", err)
+            }
+
+            if let Some(res) = tasks.try_join_next() {
+                match res {
+                    Ok(uuid) => {
+                        thread_write_map.remove(&uuid);
+                        server_write.send(ThreadMessage::TaskEnd(uuid));
+                    }
+                    Err(err) => {
+                        eprintln!("task panic!: {}", err);
+                        thread_write_map.retain(|_, sender| !sender.is_closed());
+                    }
+                }
             }
         }
     });
@@ -374,31 +429,45 @@ pub async fn uuid_tcp_server(mut server_read: UnboundedReceiver<ThreadMessage>, 
 }
 
 pub async fn server_loop(mut clients_read: UnboundedReceiver<ThreadMessage>, client_write: UnboundedSender<ThreadMessage>) {
-    // let (main_thread_write, mut main_thread_read) = unbounded_channel();
-    // let thread_write_map = Arc::new(DashMap::new());
+    let (main_thread_write, mut main_thread_read) = unbounded_channel();
+    let thread_write_map = Arc::new(DashMap::new());
     loop {
         let Some(read) = clients_read.recv().await else {
             continue
         };
 
+        let mut uuid_list = HashSet::new();
+        let mut tasks = JoinSet::new();
+        let (thread_write, thread_read) = unbounded_channel();
+        let main_thread_write_clone = main_thread_write.clone();
+
         match read {
             ThreadMessage::String(message) => {
                 match message.as_str() {
                     "New Client!" => {
-                        spawn(async move {
-                            
-                        });
+                        println!("New Client!");
                     }
                     _ => {}
                 }
             }
-            ThreadMessage::UserSate(user_sate) => {
-                if user_sate.matching_state == MatchingState::Matching {
-                    
+            ThreadMessage::Uuid(uuid) => {
+                if uuid_list.insert(uuid) {
+                    tasks.spawn(async move {
+                        user_manager().await;
+                    });
                 }
             }
-            ThreadMessage::PlayerUnboundedReceiver(am_client_read) => {
+            ThreadMessage::TaskEnd(uuid) => {
 
+            }
+            ThreadMessage::UserSate(user_sate) => {
+
+            }
+            ThreadMessage::ThreadSenders(senders) => {
+
+            }
+            ThreadMessage::AnyData(any_data) => {
+                
             }
         }
     }
