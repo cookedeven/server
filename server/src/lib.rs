@@ -26,6 +26,7 @@ use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, Map, json, to_vec};
 use dashmap::DashMap;
+use futures::SinkExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use libCode::*;
 
@@ -45,17 +46,19 @@ macro_rules! am {
 }
 
 #[macro_export]
-macro_rules! arl {
-    ($t:expr) => {
-        Arc::new(RwLock::new($t))
+macro_rules! ad {
+    () => {
+        Arc::new(DashMap::new())
     };
 }
 
 lazy_static! {
-    static ref PLAYER_TABLE: Arc<DashMap<Uuid, (AM<OwnedReadHalf>, AM<OwnedWriteHalf>)>> = Arc::new(DashMap::new());
-    static ref USER_DATA: PlayerData = Arc::new(DashMap::new());
-    static ref USER_SESSION_DATA: Arc<DashMap<SessionID, PlayerData>> = Arc::new(DashMap::new());
-    static ref USER_UNBOUNDED_SENDERS: Arc<DashMap<Uuid, UnboundedSender<PlayerData>>> = Arc::new(DashMap::new());
+    static ref PLAYER_TABLE: Arc<DashMap<Uuid, (AM<OwnedReadHalf>, AM<OwnedWriteHalf>)>> = ad!();
+    static ref USER_DATA: PlayerData = ad!();
+    static ref USER_SESSION_DATA: Arc<DashMap<SessionID, PlayerData>> = ad!();
+    static ref USER_UNBOUNDED_SENDERS: Arc<DashMap<Uuid, UnboundedSender<ThreadMessage>>> = ad!();
+    static ref USER_SERVER_UNBOUNDED_SENDERS: Arc<DashMap<Uuid, UnboundedSender<ThreadMessage>>> = ad!();
+    static ref SERVER_UNBOUNDED_SENDERS: Arc<DashMap<SessionID, UnboundedSender<ThreadMessage>>> = ad!();
 }
 
 #[derive(Default)]
@@ -71,32 +74,22 @@ impl UserState {
     }
 }
 
-struct ThreadUnboundedSenders {
-    senders: Arc<DashMap<Uuid, UnboundedSender<PlayerData>>>,
+enum ThreadMessageData {
+    String(String),
+    UserState(UserState),
+    AnyData(Box<dyn Send + Sync>)
 }
 
-impl ThreadUnboundedSenders {
-    fn new() -> Self {
-        let senders = Arc::new(DashMap::new());
-        Self { senders }
-    }
-
-    fn add_sender(&mut self, uuid: Uuid, sender: UnboundedSender<PlayerData>) {
-        self.senders.insert(uuid, sender);
-    }
-
-    fn remove_sender(&mut self, uuid: &Uuid) {
-        self.senders.remove(uuid);
-    }
+enum ThreadMessageCommand {
+    NewConnect,
+    NewPlayer(Uuid),
+    EndOfConnect(Uuid),
+    AddPlayer(Uuid),
 }
 
 pub enum ThreadMessage {
-    String(String),
-    Uuid(Uuid),
-    TaskEnd(Uuid),
-    UserSate(UserState),
-    ThreadSenders(ThreadUnboundedSenders),
-    AnyData(Arc<dyn Send + Sync>)
+    Data(ThreadMessageData),
+    Command(ThreadMessageCommand),
 }
 
 async fn read_data(read_half: &mut OwnedReadHalf, buffer: &mut [u8]) -> Result<TcpMessage, MessageError> {
@@ -321,7 +314,7 @@ async fn async_uuid_tcp_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: A
     }
 }
 
-pub async fn user_manager() {
+pub async fn user_manager(mut thread_read: UnboundedReceiver<ThreadMessage>, main_write: UnboundedSender<ThreadMessage>, thread_senders: Arc<DashMap<Uuid, UnboundedSender<ThreadMessage>>>) {
 
 }
 
@@ -332,7 +325,7 @@ pub async fn uuid_tcp_server(mut server_read: UnboundedReceiver<ThreadMessage>, 
     println!("Server listening on {}", SERVER_IP);
 
     let (main_thread_write, mut main_thread_read) = unbounded_channel();
-    let mut thread_write_map = Arc::new(DashMap::new());
+    let mut thread_write_map = ad!();
     let mut tasks = JoinSet::new();
 
     spawn(async move {
@@ -340,12 +333,12 @@ pub async fn uuid_tcp_server(mut server_read: UnboundedReceiver<ThreadMessage>, 
             match listener.accept().await {
                 Ok((stream, addr)) => {
                     println!("new client!!!!!!! addr: {}", addr);
-                    let server_message = ThreadMessage::String("New Client!".to_string());
+                    let server_message = ThreadMessage::Command(ThreadMessageCommand::NewConnect);
                     let _ = server_write.send(server_message);
                     let mut buffer = vec![0; 8192];
 
                     // Uuid 확인. 성공, 실패시 메시지 보냄.
-                    let ((am_read_half, am_write_half), uuid) = match uuid_check(stream, &mut buffer).await {
+                    let (am_read_half, am_write_half, uuid) = match uuid_check(stream, &mut buffer).await {
                         Ok(((am_read_half, am_write_half), uuid)) => {
                             let mut write_half = am_write_half.lock().await;
 
@@ -363,7 +356,7 @@ pub async fn uuid_tcp_server(mut server_read: UnboundedReceiver<ThreadMessage>, 
 
                             drop(write_half);
 
-                            ((am_read_half, am_write_half), uuid)
+                            (am_read_half, am_write_half, uuid)
                         },
                         Err((err, _, mut write_half)) => {
                             eprintln!("err: {}", err);
@@ -382,7 +375,7 @@ pub async fn uuid_tcp_server(mut server_read: UnboundedReceiver<ThreadMessage>, 
                         }
                     };
 
-                    let _ = server_write.send(ThreadMessage::Uuid(uuid));
+                    let _ = server_write.send(ThreadMessage::Command(ThreadMessageCommand::NewPlayer(uuid)));
 
                     // 스레드 채널 생성
                     let (thread_write, thread_read) = unbounded_channel();
@@ -404,7 +397,7 @@ pub async fn uuid_tcp_server(mut server_read: UnboundedReceiver<ThreadMessage>, 
                 match res {
                     Ok(uuid) => {
                         thread_write_map.remove(&uuid);
-                        server_write.send(ThreadMessage::TaskEnd(uuid));
+                        let _ = server_write.send(ThreadMessage::Command(ThreadMessageCommand::EndOfConnect(uuid)));
                     }
                     Err(err) => {
                         eprintln!("task panic!: {}", err);
@@ -430,44 +423,44 @@ pub async fn uuid_tcp_server(mut server_read: UnboundedReceiver<ThreadMessage>, 
 
 pub async fn server_loop(mut clients_read: UnboundedReceiver<ThreadMessage>, client_write: UnboundedSender<ThreadMessage>) {
     let (main_thread_write, mut main_thread_read) = unbounded_channel();
-    let thread_write_map = Arc::new(DashMap::new());
+    let user_thread_senders = USER_SERVER_UNBOUNDED_SENDERS.clone();
+    let session_thread_senders = SERVER_UNBOUNDED_SENDERS.clone();
+    let mut uuid_list = HashSet::new();
+    let mut tasks = JoinSet::new();
+
     loop {
         let Some(read) = clients_read.recv().await else {
             continue
         };
 
-        let mut uuid_list = HashSet::new();
-        let mut tasks = JoinSet::new();
-        let (thread_write, thread_read) = unbounded_channel();
         let main_thread_write_clone = main_thread_write.clone();
 
         match read {
-            ThreadMessage::String(message) => {
-                match message.as_str() {
-                    "New Client!" => {
-                        println!("New Client!");
-                    }
-                    _ => {}
-                }
-            }
-            ThreadMessage::Uuid(uuid) => {
-                if uuid_list.insert(uuid) {
-                    tasks.spawn(async move {
-                        user_manager().await;
-                    });
-                }
-            }
-            ThreadMessage::TaskEnd(uuid) => {
-
-            }
-            ThreadMessage::UserSate(user_sate) => {
-
-            }
-            ThreadMessage::ThreadSenders(senders) => {
-
-            }
-            ThreadMessage::AnyData(any_data) => {
+            ThreadMessage::Data(data) => {
                 
+            }
+            ThreadMessage::Command(command) => {
+                match command { 
+                    ThreadMessageCommand::NewConnect => println!("new client!"),
+                    ThreadMessageCommand::NewPlayer(uuid) => {
+                        if uuid_list.insert(uuid) {
+                            let user_thread_senders_clone = USER_UNBOUNDED_SENDERS.clone();
+                            let (sender, receiver) = unbounded_channel();
+                            USER_SERVER_UNBOUNDED_SENDERS.insert(uuid, sender);
+                            tasks.spawn(async move {
+                                user_manager(receiver, main_thread_write_clone, user_thread_senders_clone).await;
+                            });
+                        }
+                    }
+                    ThreadMessageCommand::EndOfConnect(uuid) => {
+                        if uuid_list.remove(&uuid) {
+                            let Some(a) = USER_SERVER_UNBOUNDED_SENDERS.get(&uuid) else {
+                                continue
+                            };
+                        }
+                    }
+                    _ => todo!()
+                }
             }
         }
     }
