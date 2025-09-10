@@ -1,61 +1,59 @@
 use std::{
     error::Error,
     fmt::{Display, Formatter},
+    str::{self, FromStr},
     sync::Arc,
-    time::{Duration, SystemTime},
-    str::FromStr
 };
-use tokio::{
-    net::TcpStream,
-    sync::{Mutex, mpsc::{UnboundedReceiver, UnboundedSender}},
-};
-use uuid::Uuid;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, to_vec, Map, Value};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
+    sync::Mutex,
+};
+use dashmap::DashMap;
 
 pub const SERVER_IP: &'static str = "127.0.0.1:8080";
-type AM<T> = Arc<Mutex<T>>;
-type Name = String;
+pub type UserData = Map<String, Value>;
+pub type AM<T> = Arc<Mutex<T>>;
+pub type AD<K, V> = Arc<DashMap<K, V>>;
 
-pub trait Log {}
+#[macro_export]
+macro_rules! send_data_setting {
+    ($data:ident, $([$uuid:expr $(, ($key:expr, $value:expr))*]),* $(,)?) => {
+        $(
+            let mut buffer = Map::new();
 
-pub struct MessageLog {
-    data: Box<dyn Log + Send + Sync>
+            $(
+                buffer.insert($key, json!($value));
+            )*
+            $data.insert($uuid, json!(buffer));
+        )*
+    };
 }
 
-impl MessageLog {
-    pub fn new(data: Box<dyn Log + Send + Sync>) -> Self {
-        Self { data }
-    }
+#[macro_export]
+macro_rules! request_data_setting {
+    ($request_data:ident, $([$uuid:expr $(, $value:expr)*]),* $(,)?) => {
+        $(
+            let mut buffer = Vec::new();
+
+            $(
+                buffer.push(json!($value));
+            )*
+            $request_data.insert($uuid, json!(buffer));
+        )*
+    };
 }
 
-pub struct ErrorLogging {
-    error: Box<dyn Error + Send + Sync>,
-    system_time: SystemTime,
-    duration: Duration,
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct TcpMessage {
+    pub send_type: String,
+    pub command: String,
+    pub uuid: String,
+    pub send_data: UserData, // Map<Uuid, Map<DataName, Value>>
+    pub request_data: UserData // Map<Uuid, Vec<Value>>
 }
-
-impl ErrorLogging {
-    pub fn new(error: Box<dyn Error + Send + Sync>, system_time: SystemTime, duration: Duration) -> Self {
-        Self { error, system_time, duration }
-    }
-}
-
-impl Log for ErrorLogging {}
-
-pub struct UpdateState {
-    state: String,
-    system_time: SystemTime,
-    duration: Duration,
-}
-
-impl UpdateState {
-    pub fn new(state: String, system_time: SystemTime, duration: Duration) -> Self {
-        Self { state, system_time, duration }
-    }
-}
-
-impl Log for UpdateState {}
 
 #[derive(Debug)]
 pub enum MessageError {
@@ -73,7 +71,7 @@ pub enum MessageError {
     InvalidType,
     InvalidUtf8(std::str::Utf8Error),
     DeserializeError(serde_json::Error),
-    Errors(Vec<Box<Self>>),
+    Errors(Vec<Self>),
     OtherError(Box<dyn Error + Send + Sync>),
     FatalError(Box<dyn Error + Send + Sync>)
 }
@@ -114,11 +112,22 @@ impl Display for MessageError {
             Self::NotLongEnough => write!(f, "message not long enough"),
             Self::CommandNotFound => write!(f, "command not found"),
             Self::CommunicationError => write!(f, "communication error"),
-            Self::TooLong => write!(f, "message too long"),
             Self::UndefinedError => write!(f, "undefined error"),
+            Self::TooLong => write!(f, "message too long"),
             Self::EmptyCommand => write!(f, "empty command"),
             Self::InvalidUUID => write!(f, "invalid UUID format"),
             Self::MissingUUID => write!(f, "UUID is missing"),
+            Self::ParseError => write!(f, "parse error"),
+            Self::ConnectionClosed => write!(f, "connection closed"),
+            Self::InvalidType => write!(f, "invalid type"),
+            Self::InvalidUtf8(e) => write!(f, "invalid UTF8: {}", e),
+            Self::DeserializeError(e) => write!(f, "deserialize error: {}", e),
+            Self::Errors(errors) => {
+                for error in errors {
+                    write!(f, "{} ", error)?;
+                }
+                Ok(())
+            }
             Self::OtherError(err) => write!(f, "{}", err),
             Self::FatalError(err) => write!(f, "fatal error: {}", err),
             _ => write!(f, "undefined unknown error"),
@@ -142,75 +151,6 @@ pub enum QueueType {
     Two,
     Four
 }
-
-pub struct PlayerStream {
-    pub tcp_stream: TcpStream,
-    pub uuid: Uuid,
-}
-
-pub type ClientMessageSender = UnboundedSender<ClientMessage>;
-pub type ClientMessageReceiver = UnboundedReceiver<ClientMessage>;
-pub type ServerMessageSender = UnboundedSender<ServerMessage>;
-pub type ServerMessageReceiver = UnboundedReceiver<ServerMessage>;
-pub type ClientThreadMessageSender = UnboundedSender<ClientThreadMessage>;
-pub type ClientThreadMessageReceiver = UnboundedReceiver<ClientThreadMessage>;
-pub type ServerThreadMessageSender = UnboundedSender<ServerThreadMessage>;
-pub type ServerThreadMessageReceiver = UnboundedReceiver<ServerThreadMessage>;
-
-pub struct ClientMessage {
-    uuid: Uuid,
-    context: String
-}
-
-impl ClientMessage {
-    pub fn new(uuid: Uuid, context: String) -> Self {
-        Self { uuid, context }
-    }
-}
-
-pub struct ServerMessage {
-    uuid: Uuid,
-    context: String
-}
-
-impl ServerMessage {
-    pub fn new(uuid: Uuid, context: String) -> Self {
-        Self { uuid, context }
-    }
-}
-
-pub struct ClientThreadMessage {
-    uuid: Uuid,
-    context: String
-}
-
-impl ClientThreadMessage {
-    pub fn new(uuid: Uuid, context: String) -> Self {
-        Self { uuid, context }
-    }
-}
-
-pub struct ServerThreadMessage {
-    uuid: Uuid,
-    context: String
-}
-
-impl ServerThreadMessage {
-    pub fn new(uuid: Uuid, context: String) -> Self {
-        Self { uuid, context }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct TcpMessage {
-    pub send_type: String,
-    pub command: String,
-    pub uuid: String,
-    pub send_data: UserData,
-    pub request_data: UserData
-}
-
-pub type UserData = Map<String, Value>; // Map<Uuid, Map<DataName, Value>>
 
 #[derive(Default, Eq, PartialEq)]
 pub enum MatchingState {
@@ -281,5 +221,34 @@ impl Display for ErrorLevel {
                 Self::Ok => "ok"
             }
         )
+    }
+}
+
+pub async fn read_data(read_half: &mut OwnedReadHalf, buffer: &mut [u8]) -> Result<TcpMessage, MessageError> {
+    let size = read_half.read(buffer).await.map_err(|e| MessageError::OtherError(e.into()))?;
+    if size == 0 {
+        return Err(MessageError::ConnectionClosed);
+    }
+
+    let message_bytes = &buffer[..size];
+    let string_message = str::from_utf8(message_bytes).map_err(|e| MessageError::InvalidUtf8(e))?;
+
+    println!("string_message: {}", string_message);
+
+    let tcp_message: TcpMessage = serde_json::from_str(string_message).map_err(|e| MessageError::DeserializeError(e))?;
+
+    println!("parse data: {:?}", tcp_message);
+
+    Ok(tcp_message)
+}
+
+pub async fn send_tcp_message(write_half: &mut OwnedWriteHalf, tcp_message: TcpMessage) {
+    let tcp_message_json = json!(tcp_message);
+
+    match to_vec(&tcp_message_json) {
+        Ok(tcp_message_json_byte) => {
+            let _ = write_half.write_all(&tcp_message_json_byte).await;
+        },
+        Err(err) => eprintln!("err: {}", err)
     }
 }

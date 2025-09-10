@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["libCode", "server"]
+members = [ "client","libCode", "server"]
