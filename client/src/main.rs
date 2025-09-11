@@ -74,6 +74,11 @@ async fn main() {
         [uuid.clone(), ("matching".to_string(), json!(false))]
     );
 
+    loop {
+
+    }
+
+    /*
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
     let message = TcpMessage {
@@ -87,4 +92,5 @@ async fn main() {
     println!("send: {:?}", message);
 
     send_tcp_message(&mut write, message).await;
+    */
 }

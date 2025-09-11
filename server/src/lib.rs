@@ -4,6 +4,7 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
+use std::net::SocketAddr;
 use tokio::{
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -21,6 +22,7 @@ use uuid::Uuid;
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use serde_json::{json, Map, Value};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 // use libCode::{ErrorLevel, MatchingState, MessageError, SERVER_IP, TcpMessage, UserData};
 use libCode::*;
 
@@ -363,7 +365,7 @@ async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedW
                             };
                         }
                     }
-                    ThreadMessage::Data(_) => {}
+                    ThreadMessage::Data(_) => todo!(),
                     ThreadMessage::Command(ThreadMessageCommand::EndOfTask) => return Ok(()),
                     ThreadMessage::Command(ThreadMessageCommand::NewSession2(uuid_1, uuid_2)) => {
                         let player_data = USER_DATA.clone();
@@ -386,7 +388,7 @@ async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedW
 
                         send_tcp_message(&mut write_half, message).await;
                     }
-                    ThreadMessage::Command(_) => {}
+                    ThreadMessage::Command(_) => todo!()
                 }
             }
         }
@@ -418,7 +420,7 @@ async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedW
 }
 
 async fn user_manager(mut thread_read: UnboundedReceiver<ThreadMessage>, main_write: UnboundedSender<ThreadMessage>, thread_senders: Arc<DashMap<Uuid, UnboundedSender<ThreadMessage>>>) {
-
+    todo!()
 }
 
 async fn session_manager_2(session_id: SessionID, session_read: UnboundedReceiver<ThreadMessage>, main_write: UnboundedSender<ThreadMessage>, thread_senders: Arc<DashMap<Uuid, UnboundedSender<ThreadMessage>>>, uuid_1: Uuid, uuid_2: Uuid) -> Result<(), MessageError> {
@@ -437,20 +439,24 @@ async fn session_manager_2(session_id: SessionID, session_read: UnboundedReceive
     let _ = user_1_sender.send(ThreadMessage::Data(ThreadMessageData::SessionID(session_id)));
     let _ = user_2_sender.send(ThreadMessage::Data(ThreadMessageData::SessionID(session_id)));
 
-
-
-
     Ok(())
 }
 
 async fn session_manager_4(session_id: SessionID, session_read: UnboundedReceiver<ThreadMessage>, main_write: UnboundedSender<ThreadMessage>, thread_senders: Arc<DashMap<Uuid, UnboundedSender<ThreadMessage>>>, uuid_1: Uuid, uuid_2: Uuid, uuid_3: Uuid, uuid_4: Uuid) {
-
+    todo!()
 }
 
 pub async fn player_tcp_handle(mut server_read: UnboundedReceiver<ThreadMessage>, server_write: UnboundedSender<ThreadMessage>) {
-    let Ok(listener) = TcpListener::bind(SERVER_IP).await else {
-        panic!("cannot bind {}", SERVER_IP)
-    };
+    let server_addr = SocketAddr::from_str(SERVER_IP).expect("Could not parse server IP");
+
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("Could not create socket");
+
+    socket.set_reuse_address(true).expect("Could not reuse TCP");
+
+    socket.bind(&server_addr.into()).expect("Could not bind server");
+    socket.listen(128).expect("Could not listen");
+
+    let listener = TcpListener::from_std(socket.into()).expect("Could not create listener");
     println!("Server listening on {}", SERVER_IP);
 
     let (main_thread_write, mut main_thread_read) = unbounded_channel();
@@ -640,11 +646,4 @@ pub async fn server_loop(mut clients_read: UnboundedReceiver<ThreadMessage>, cli
             }
         }
     }
-}
-
-pub fn init(file: &mut File) -> Result<(), MessageError> {
-    let mut buffer = String::new();
-    file.read_to_string(&mut buffer)?;
-
-    Ok(())
 }

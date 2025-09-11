@@ -8,9 +8,9 @@ async fn main() {
     let (client_write, client_read) = unbounded_channel();
     let (server_write, server_read) = unbounded_channel();
     let handle1 = tokio::spawn(player_tcp_handle(client_read, server_write));
-    // let handle2 = tokio::spawn(server_loop(server_read, client_write));
+    let handle2 = tokio::spawn(server_loop(server_read, client_write));
     
     handle1.await.expect("player_tcp_handle failed");
-    // handle2.await.expect("server_loop failed");
+    handle2.await.expect("server_loop failed");
 
 }
