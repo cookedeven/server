@@ -1,9 +1,9 @@
 use std::{
-    fs::File,
-    io::Read,
+    thread,
     str::FromStr,
     sync::Arc,
 };
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::{
     net::{
@@ -16,13 +16,16 @@ use tokio::{
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
         Mutex,
     },
-    task::JoinSet
+    task::JoinSet,
+    time::sleep,
 };
 use uuid::Uuid;
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use serde_json::{json, Map, Value};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use tokio::io::WriteHalf;
+use tokio::task::yield_now;
 // use libCode::{ErrorLevel, MatchingState, MessageError, SERVER_IP, TcpMessage, UserData};
 use libCode::*;
 
@@ -53,33 +56,6 @@ macro_rules! end_of_tasks {
     };
 }
 
-macro_rules! name_get {
-    ($player_data:expr, $get_uuid:expr, $write_half:expr, $uuid:expr) => {
-        $player_data.get(&$get_uuid).and_then(|data| data.get("name").map(|name_ref| name_ref.value().clone())).and_then(|name| {
-            match name {
-                Value::String(name) => Some(name),
-                _ => None
-            }
-        }).unwrap_or({
-            let mut send_data = Map::new();
-            send_data_setting!(send_data,
-                [$uuid, ("error".to_string(), json!(format!("invalid uuid: {}", $get_uuid)))]
-            );
-
-            let message = TcpMessage {
-                send_type: "error".to_string(),
-                command: ErrorLevel::Warning.to_string(),
-                uuid: $uuid.to_string(),
-                send_data,
-                request_data: Map::new()
-            };
-
-            send_tcp_message(&mut $write_half, message).await;
-            "ERRORRRRRRRRRRRRRRRRRRRRRRRRRRRR".to_string()
-        })
-    }
-}
-
 lazy_static! {
     static ref PLAYER_TABLE: AD<Uuid, (AM<OwnedReadHalf>, AM<OwnedWriteHalf>)> = ad!();
     static ref MATCH_QUEUE_2: AM<Vec<Uuid>> = am!(Vec::new());
@@ -95,7 +71,8 @@ lazy_static! {
 struct UserState {
     data: UserData,
     uuid: Uuid,
-    matching_state: MatchingState
+    matching_state_2: MatchingState,
+    matching_state_4: MatchingState,
 }
 
 impl UserState {
@@ -137,6 +114,39 @@ enum ThreadMessageCommand {
 pub enum ThreadMessage {
     Data(ThreadMessageData),
     Command(ThreadMessageCommand),
+}
+
+pub enum MessageCommand {
+    AddPlayer2(Uuid),
+    RemovePlayer2(Uuid),
+    AddPlayer4(Uuid),
+    RemovePlayer4(Uuid),
+    SendTcpMessage(TcpMessage),
+}
+
+fn name_get(player_data: &PlayerData, get_uuid: Uuid, uuid: Uuid, write_half: &mut OwnedWriteHalf) -> Result<String, TcpMessage> {
+    player_data.get(&get_uuid).and_then(|data| data.get("name").map(|name_ref| name_ref.value().clone())).and_then(|name| {
+        match name {
+            Value::String(name) => Some(name),
+            _ => None
+        }
+    }).ok_or_else(|| {
+        println!("이름 가져오기 실패!");
+        let mut send_data = Map::new();
+        send_data_setting!(send_data,
+            [uuid.to_string(), ("error".to_string(), json!(format!("invalid uuid: {}", get_uuid)))]
+        );
+
+        let message = TcpMessage {
+            send_type: "error".to_string(),
+            command: ErrorLevel::Warning.to_string(),
+            uuid: uuid.to_string(),
+            send_data,
+            request_data: Map::new()
+        };
+
+        message
+    })
 }
 
 async fn uuid_check(tcp_stream: TcpStream, buffer: &mut [u8]) -> Result<((AM<OwnedReadHalf>, AM<OwnedWriteHalf>), Uuid), (MessageError, OwnedReadHalf, OwnedWriteHalf)> {
@@ -192,34 +202,50 @@ async fn name_check(read_half: &mut OwnedReadHalf, uuid: Uuid, buffer: &mut [u8]
     Ok(name.to_string())
 }
 
-fn send_data_handle(send_data: UserData, uuid: &Uuid, name: &Name, state: &mut UserState) -> Result<(), MessageError> {
+fn send_data_handle(send_data: UserData, uuid: &Uuid, name: &Name, state: &mut UserState) -> Vec<Result<MessageCommand, MessageError>> {
     if send_data.is_empty() {
-        return Ok(())
+        return Vec::new()
     }
+
+    let mut result = Vec::new();
 
     println!("send_data: {:?}", send_data);
 
     for (send_data_uuid, data_value) in send_data {
         println!("send_data_uuid: {:?}", send_data_uuid);
 
-        let data = data_value.as_object().ok_or_else(|| MessageError::InvalidType)?;
+        let data = match data_value.as_object() {
+            Some(data) => data,
+            None => {
+                result.push(Err(MessageError::InvalidType));
+                continue
+            }
+        };
 
         if send_data_uuid == uuid.to_string() {
             for (data_name, value) in data {
                 println!("data_name: {:?}", data_name);
                 match data_name.as_str() {
-                    "matching" => {
+                    "matching_2" => {
                         println!("value: {:?}", value);
-                        let match_state = value.as_bool().ok_or_else(|| MessageError::InvalidType)?;
+                        let match_state = match value.as_bool() {
+                            Some(match_state) => match_state,
+                            None => {
+                                result.push(Err(MessageError::InvalidType));
+                                continue
+                            }
+                        };
+
                         if match_state {
-                            if state.matching_state == MatchingState::Nothing || state.matching_state == MatchingState::None {
+                            if state.matching_state_2 == MatchingState::Nothing || state.matching_state_2 == MatchingState::None {
                                 println!("매칭중!: {}", name);
-                                state.matching_state = MatchingState::Matching;
+                                state.matching_state_2 = MatchingState::Matching;
+                                result.push(Ok(MessageCommand::AddPlayer2(uuid.clone())));
                             }
                         } else {
-                            if state.matching_state == MatchingState::Matching {
+                            if state.matching_state_2 == MatchingState::Matching {
                                 println!("매칭 종료!: {}", name);
-                                state.matching_state = MatchingState::Nothing;
+                                state.matching_state_2 = MatchingState::Nothing;
                             }
                         }
                     }
@@ -229,13 +255,15 @@ fn send_data_handle(send_data: UserData, uuid: &Uuid, name: &Name, state: &mut U
         }
     }
 
-    Ok(())
+    result
 }
 
-fn request_data_handle(request_data: UserData, uuid: &Uuid, name: &Name, state: &mut UserState) -> Result<Option<TcpMessage>, MessageError> {
+fn request_data_handle(request_data: UserData, uuid: &Uuid, name: &Name, state: &mut UserState) -> Vec<Result<MessageCommand, MessageError> >{
     if request_data.is_empty() {
-        return Ok(None)
+        return Vec::new()
     }
+
+    let mut result = Vec::new();
 
     for (uuid, data_value) in &request_data {
         match data_value {
@@ -249,37 +277,86 @@ fn request_data_handle(request_data: UserData, uuid: &Uuid, name: &Name, state: 
                     request_data: Map::new()
                 };
 
-                return Ok(Some(message))
+                result.push(Ok(MessageCommand::SendTcpMessage(message)));
             }
-            _ => return Err(MessageError::InvalidType)
+            _ => result.push(Err(MessageError::InvalidType))
         }
     }
     
-    Ok(None)
+    result
 }
 
-async fn message_handle(read_half: &mut OwnedReadHalf, write_half: &mut OwnedWriteHalf, uuid: Uuid, name: &Name, state: &mut UserState, buffer: &mut [u8]) -> Result<(), MessageError> {
-    let tcp_message = match read_data(read_half, buffer).await {
+async fn message_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedWriteHalf>, uuid: Uuid, name: &Name, am_state: AM<UserState>, buffer: &mut [u8], user_sender: AD<Uuid, UnboundedSender<ThreadMessage>>) -> (Result<(), MessageError>, Result<(), Vec<MessageError>>) {
+    let mut read_half = am_read_half.lock().await;
+    let tcp_message = match read_data(&mut read_half, buffer).await {
         Ok(tcp_message) => tcp_message,
-        Err(err) => return Err(err)
+        Err(err) => return (Err(err), Err(Vec::new()))
     };
+    drop(read_half);
 
     if tcp_message.send_type.as_str() != "connect" {
-        return Err(MessageError::CommandNotFound);
+        return (Err(MessageError::CommandNotFound), Err(Vec::new()));
     }
 
-    let send_data_result = send_data_handle(tcp_message.send_data, &uuid, name, state);
-    let request_data_result = request_data_handle(tcp_message.request_data, &uuid, name, state);
+    let mut state = am_state.lock().await;
 
-    match (send_data_result, request_data_result) {
-        (Ok(_), Ok(_)) => Ok(()),
-        (Err(e1), Ok(_)) => Err(e1),
-        (Ok(_), Err(e2)) => Err(e2),
-        (Err(e1), Err(e2)) => Err(MessageError::Errors(vec![e1, e2])),
+    let send_data_result = send_data_handle(tcp_message.send_data, &uuid, name, &mut state);
+    let request_data_result = request_data_handle(tcp_message.request_data, &uuid, name, &mut state);
+
+    drop(state);
+
+    let (ok_data_result, err_data_result): (Vec<_>, Vec<_>) = send_data_result.into_iter().chain(request_data_result.into_iter()).partition(|result| result.is_ok());
+
+    let ok_data_result: Vec<_> = ok_data_result.into_iter().filter_map(Result::ok).collect();
+    let err_data_result: Vec<_> = err_data_result.into_iter().filter_map(Result::err).collect();
+
+    let (first_result, second_result);
+
+    if ok_data_result.is_empty() {
+        first_result = Ok(());
+    } else {
+        for ok_result in ok_data_result {
+            match ok_result {
+                MessageCommand::AddPlayer2(uuid) => {
+                    let mut match_queue_2 = MATCH_QUEUE_2.lock().await;
+                    match_queue_2.push(uuid);
+                    println!("매칭 진입! 인원수 2");
+                }
+                MessageCommand::RemovePlayer2(uuid) => {
+                    let mut match_queue_2 = MATCH_QUEUE_2.lock().await;
+                    match_queue_2.retain(|queue_uuid| *queue_uuid != uuid);
+                    println!("매칭 종료! 인원수 2")
+                }
+                MessageCommand::AddPlayer4(uuid) => {
+                    let mut match_queue_4 = MATCH_QUEUE_4.lock().await;
+                    match_queue_4.push(uuid);
+                }
+                MessageCommand::RemovePlayer4(uuid) => {
+                    let mut match_queue_4 = MATCH_QUEUE_4.lock().await;
+                    match_queue_4.retain(|queue_uuid| *queue_uuid != uuid);
+                }
+                MessageCommand::SendTcpMessage(message) => {
+                    let mut write_half = am_write_half.lock().await;
+                    send_tcp_message(&mut write_half, message).await;
+                }
+            }
+        }
+        first_result = Ok(());
     }
+
+    if err_data_result.is_empty() {
+        second_result = Ok(());
+    } else {
+        second_result = Err(err_data_result);
+    }
+
+
+
+
+    (first_result, second_result)
 }
 
-async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedWriteHalf>, uuid: Uuid, main_write: UnboundedSender<ThreadMessage>, thread_read: UnboundedReceiver<ThreadMessage>, mut buffer: Vec<u8>, thread_senders: Arc<DashMap<Uuid, UnboundedSender<ThreadMessage>>>) -> Result<Uuid, (Uuid, MessageError)> {
+async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedWriteHalf>, uuid: Uuid, main_write: UnboundedSender<ThreadMessage>, thread_read: UnboundedReceiver<ThreadMessage>, mut buffer: Vec<u8>, user_senders: AD<Uuid, UnboundedSender<ThreadMessage>>) -> Result<Uuid, (Uuid, MessageError)> {
     println!("new player! uuid: {}", uuid);
     
     let mut read_half = am_read_half.lock().await;
@@ -332,65 +409,129 @@ async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedW
         }
     };
 
+    let mut user_data = USER_DATA.clone();
+    let dash_map_name = HashMap::from([
+        ("name".to_string(), json!(name)),
+    ]).into_iter().collect();
+
+    user_data.insert(uuid, Arc::new(dash_map_name));
+
     drop(read_half);
 
+    let write_half_clone_0 = am_write_half.clone();
+    let write_half_clone_1 = am_write_half.clone();
     let read_half_clone_0 = am_read_half.clone();
-    let mut state = UserState::default();
+    let read_half_clone_1 = am_read_half.clone();
+    let am_state = am!(UserState::default());
+    let state_clone_0 = am_state.clone();
+    let state_clone_1 = am_state.clone();
     let mut tasks = JoinSet::new();
     let tasks_sender = am!(Vec::new());
     let tasks_sender_clone = tasks_sender.clone();
     let (sender, mut receiver) = unbounded_channel();
+    let tcp_thread_senders = USER_UNBOUNDED_SENDERS.clone();
+    tcp_thread_senders.insert(uuid, sender.clone());
 
     tasks.spawn(async move {
-        let mut write_half = am_write_half.lock().await;
-        let mut read_half = read_half_clone_0.lock().await;
+        println!("thread spawned");
         tasks_sender_clone.lock().await.push(sender);
+        drop(tasks_sender_clone);
         loop {
-            let result = message_handle(&mut read_half, &mut write_half, uuid, &name, &mut state, &mut buffer).await;
-            if let Err(error) = result {
+            let write_half = write_half_clone_0.clone();
+            let read_half = read_half_clone_0.clone();
+            let state = state_clone_0.clone();
+            println!("읽기 준비중. uuid: {}", uuid);
+            let user_sender = user_senders.clone();
+            let (send_data_result, request_data_result) = message_handle(read_half, write_half, uuid, &name, state, &mut buffer, user_sender).await;
+
+            if let Err(error) = send_data_result {
                if error.unrecoverable_error() {
+                   println!("읽기 종료!");
                    return Err(MessageError::OtherError(error.into()));
                }
             }
 
-            if let Ok(message) = receiver.try_recv() {
-                match message {
-                    ThreadMessage::Data(ThreadMessageData::SessionID(session_id)) => {
-                        if state.matching_state == MatchingState::Matching {
+            if let Err(error) = request_data_result {
+               for err in error {
+                   if err.unrecoverable_error() {
+                       println!("읽기 종료!");
+                       return Err(MessageError::OtherError(err.into()));
+                   }
+               }
+            }
 
-                        } else {
-                            let session_senders = SERVER_UNBOUNDED_SENDERS.clone();
-                            let Some(session_sender) = session_senders.get(&session_id) else {
-                                return Err(MessageError::NotFound)
-                            };
-                        }
-                    }
-                    ThreadMessage::Data(_) => todo!(),
-                    ThreadMessage::Command(ThreadMessageCommand::EndOfTask) => return Ok(()),
-                    ThreadMessage::Command(ThreadMessageCommand::NewSession2(uuid_1, uuid_2)) => {
-                        let player_data = USER_DATA.clone();
-                        let name_1 = name_get!(player_data, uuid_1, write_half, uuid.to_string());
-                        let name_2 = name_get!(player_data, uuid_2, write_half, uuid.to_string());
+            yield_now().await;
+        }
+    });
 
-                        let mut send_data = Map::new();
-                        send_data_setting!(send_data,
-                            [uuid_1.to_string(), ("name".to_string(), json!(name_1))],
-                            [uuid_2.to_string(), ("name".to_string(), json!(name_2))]
-                        );
+    tasks.spawn(async move {
+        loop {
+            println!("플레이어 헨들 읽기 준비! uuid: {}", uuid);
+            let Some(message) = receiver.recv().await else {
+                return Err(MessageError::ConnectionClosed)
+            };
 
-                        let message = TcpMessage {
-                            send_type: "data".to_string(),
-                            command: "push".to_string(),
-                            uuid: uuid.to_string(),
-                            send_data,
-                            request_data: Map::new()
+            println!("플레이어 헨들에서 메시지 읽음! uuid: {}", uuid);
+
+            match message {
+                ThreadMessage::Data(ThreadMessageData::SessionID(session_id)) => {
+                    let state = state_clone_1.lock().await;
+                    if state.matching_state_2 == MatchingState::Matching {
+                        println!("매칭");
+                        state.matching_state_2 == MatchingState::Playing;
+                        let session_senders = SERVER_UNBOUNDED_SENDERS.clone();
+                        let Some(session_sender) = session_senders.get(&session_id) else {
+                            return Err(MessageError::NotFound)
                         };
 
-                        send_tcp_message(&mut write_half, message).await;
+                    } else {
+                        println!("매칭칭");
                     }
-                    ThreadMessage::Command(_) => todo!()
                 }
+                ThreadMessage::Data(_) => {}
+                ThreadMessage::Command(ThreadMessageCommand::EndOfTask) => return Ok(()),
+                ThreadMessage::Command(ThreadMessageCommand::NewSession2(uuid_1, uuid_2)) => {
+                    let mut write_half = write_half_clone_1.lock().await;
+                    println!("매칭 완료! 인원수: 2 uuid: {}", uuid);
+                    let player_data = USER_DATA.clone();
+                    let name_1 = match name_get(&player_data, uuid_1, uuid, &mut write_half) {
+                        Ok(name_1) => name_1,
+                        Err(message) => {
+                            println!("이름 불러오기 문제 발생!!!!!");
+                            send_tcp_message(&mut write_half, message).await;
+                            "ERRORRRRRRRRRRRRRRRRRRRRRRRRRRRR".to_string()
+                        }
+                    };
+
+                    let name_2 = match name_get(&player_data, uuid_2, uuid, &mut write_half) {
+                        Ok(name_2) => name_2,
+                        Err(message) => {
+                            println!("이름 불러오기 문제 발생!!!!!");
+                            send_tcp_message(&mut write_half, message).await;
+                            "ERRORRRRRRRRRRRRRRRRRRRRRRRRRRRR".to_string()
+                        }
+                    };
+
+                    let mut send_data = Map::new();
+                    send_data_setting!(send_data,
+                        [uuid_1.to_string(), ("name".to_string(), json!(name_1))],
+                        [uuid_2.to_string(), ("name".to_string(), json!(name_2))]
+                    );
+
+                    let message = TcpMessage {
+                        send_type: "data".to_string(),
+                        command: "push".to_string(),
+                        uuid: uuid.to_string(),
+                        send_data,
+                        request_data: Map::new()
+                    };
+
+                    send_tcp_message(&mut write_half, message).await;
+                }
+                ThreadMessage::Command(_) => {}
             }
+
+            yield_now().await;
         }
     });
 
@@ -419,11 +560,92 @@ async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedW
     }
 }
 
+async fn player_process(stream: TcpStream, addr: SocketAddr, server_write: UnboundedSender<ThreadMessage>, thread_write_map: AD<Uuid, UnboundedSender<ThreadMessage>>, main_thread_write: UnboundedSender<ThreadMessage>) {
+    println!("new client!!!!!!! addr: {}", addr);
+    let server_message = ThreadMessage::Command(ThreadMessageCommand::NewConnect);
+    let _ = server_write.send(server_message);
+    let mut buffer = vec![0; 65536];
+
+    // Uuid 확인. 성공, 실패시 메시지 보냄.
+    let (am_read_half, am_write_half, uuid) = match uuid_check(stream, &mut buffer).await {
+        Ok(((am_read_half, am_write_half), uuid)) => {
+            let mut write_half = am_write_half.lock().await;
+
+            println!("am tcp stream is ok!");
+
+            let tcp_message = TcpMessage {
+                send_type: "set_uuid".to_string(),
+                command: ErrorLevel::Ok.to_string(),
+                uuid: uuid.to_string(),
+                send_data: Map::new(),
+                request_data: Map::new()
+            };
+
+            send_tcp_message(&mut write_half, tcp_message).await;
+
+            drop(write_half);
+
+            (am_read_half, am_write_half, uuid)
+        },
+        Err((err, _, mut write_half)) => {
+            eprintln!("err: {}", err);
+
+            let tcp_message = TcpMessage {
+                send_type: "error".to_string(),
+                command: ErrorLevel::Fatal.to_string(),
+                uuid: String::new(),
+                send_data: Map::new(),
+                request_data: Map::new()
+            };
+
+            send_tcp_message(&mut write_half, tcp_message).await;
+
+            return;
+        }
+    };
+
+    let _ = server_write.send(ThreadMessage::Command(ThreadMessageCommand::NewPlayer(uuid)));
+
+    // 스레드 채널 생성
+    let (thread_write, thread_read) = unbounded_channel();
+    // 스레드 채널 추가
+    thread_write_map.insert(uuid, thread_write);
+    let mut tasks = JoinSet::new();
+    let thread_write_map_clone = thread_write_map.clone();
+    tasks.spawn(async move {
+        player_handle(am_read_half, am_write_half, uuid, main_thread_write, thread_read, buffer, thread_write_map_clone).await
+    });
+
+    if let Some(res) = tasks.join_next().await {
+        println!("task 정상 종료!");
+        match res {
+            Ok(result) => match result {
+                Ok(uuid) => {
+                    thread_write_map.remove(&uuid);
+                    let _ = server_write.send(ThreadMessage::Command(ThreadMessageCommand::EndOfConnect(uuid)));
+                }
+                Err((uuid, err)) => {
+                    thread_write_map.remove(&uuid);
+                    eprintln!("err: {}", err);
+                }
+            }
+            Err(err) => {
+                eprintln!("task panic!: {}", err);
+                thread_write_map.retain(|_, sender| !sender.is_closed());
+            }
+        }
+    } else {
+        println!("task panic!");
+    }
+}
+
 async fn user_manager(mut thread_read: UnboundedReceiver<ThreadMessage>, main_write: UnboundedSender<ThreadMessage>, thread_senders: Arc<DashMap<Uuid, UnboundedSender<ThreadMessage>>>) {
-    todo!()
+    
 }
 
 async fn session_manager_2(session_id: SessionID, session_read: UnboundedReceiver<ThreadMessage>, main_write: UnboundedSender<ThreadMessage>, thread_senders: Arc<DashMap<Uuid, UnboundedSender<ThreadMessage>>>, uuid_1: Uuid, uuid_2: Uuid) -> Result<(), MessageError> {
+    println!("세션 생성! id: {}, player_1_uuid: {}, player_2_uuid: {}", session_id, uuid_1, uuid_2);
+
     let user_senders = USER_UNBOUNDED_SENDERS.clone();
     let Some(user_1_sender) = user_senders.get(&uuid_1) else {
         return Err(MessageError::NotFound);
@@ -433,6 +655,7 @@ async fn session_manager_2(session_id: SessionID, session_read: UnboundedReceive
         return Err(MessageError::NotFound);
     };
 
+    println!("유저 핸들에 메시지 보냄!");
     let _ = user_1_sender.send(ThreadMessage::Command(ThreadMessageCommand::NewSession2(uuid_1, uuid_2)));
     let _ = user_2_sender.send(ThreadMessage::Command(ThreadMessageCommand::NewSession2(uuid_2, uuid_1)));
 
@@ -443,7 +666,7 @@ async fn session_manager_2(session_id: SessionID, session_read: UnboundedReceive
 }
 
 async fn session_manager_4(session_id: SessionID, session_read: UnboundedReceiver<ThreadMessage>, main_write: UnboundedSender<ThreadMessage>, thread_senders: Arc<DashMap<Uuid, UnboundedSender<ThreadMessage>>>, uuid_1: Uuid, uuid_2: Uuid, uuid_3: Uuid, uuid_4: Uuid) {
-    todo!()
+    
 }
 
 pub async fn player_tcp_handle(mut server_read: UnboundedReceiver<ThreadMessage>, server_write: UnboundedSender<ThreadMessage>) {
@@ -461,118 +684,65 @@ pub async fn player_tcp_handle(mut server_read: UnboundedReceiver<ThreadMessage>
 
     let (main_thread_write, mut main_thread_read) = unbounded_channel();
     let thread_write_map = ad!();
+    let mut tasks = JoinSet::new();
+
+    let server_write_clone = server_write.clone();
+
+    // /*
+    tasks.spawn(async move {
+        loop {
+            let mut match_queue_2 = MATCH_QUEUE_2.lock().await;
+            let mut match_queue_4 = MATCH_QUEUE_4.lock().await;
+            if match_queue_2.len() >= 2 {
+                println!("매칭 수락! 2");
+                let uuid_1 = match_queue_2.remove(0);
+                let uuid_2 = match_queue_2.remove(0);
+                let _ = server_write_clone.send(ThreadMessage::Command(ThreadMessageCommand::NewSession2(uuid_1, uuid_2)));
+            }
+
+            if match_queue_4.len() >= 4 {
+                println!("매칭 수락! 4");
+                let uuid_1 = match_queue_4.remove(0);
+                let uuid_2 = match_queue_4.remove(0);
+                let uuid_3 = match_queue_4.remove(0);
+                let uuid_4 = match_queue_4.remove(0);
+                let _ = server_write_clone.send(ThreadMessage::Command(ThreadMessageCommand::NewSession4(uuid_1, uuid_2, uuid_3, uuid_4)));
+            }
+
+            yield_now().await;
+        }
+    });
+    // */
+
+    tasks.spawn(async move {
+        loop {
+            let Some(read) = server_read.recv().await else {
+                continue
+            };
+
+            yield_now().await;
+        }
+    });
 
     loop {
-        let server_write_clone_0 = server_write.clone();
-        let server_write_clone_1 = server_write.clone();
-        let server_write_clone_2 = server_write.clone();
-        let main_thread_write_clone_0 = main_thread_write.clone();
-        let thread_write_map_clone_0 = thread_write_map.clone();
-        let thread_write_map_clone_1 = thread_write_map.clone();
-        let mut tasks = JoinSet::new();
+        let server_write_clone = server_write.clone();
+        let main_thread_write_clone = main_thread_write.clone();
+        let thread_write_map_clone = thread_write_map.clone();
 
         match listener.accept().await {
             Ok((stream, addr)) => {
-                tasks.spawn(async move {
-                    println!("new client!!!!!!! addr: {}", addr);
-                    let server_message = ThreadMessage::Command(ThreadMessageCommand::NewConnect);
-                    let _ = server_write_clone_0.send(server_message);
-                    let mut buffer = vec![0; 65536];
-
-                    // Uuid 확인. 성공, 실패시 메시지 보냄.
-                    let (am_read_half, am_write_half, uuid) = match uuid_check(stream, &mut buffer).await {
-                        Ok(((am_read_half, am_write_half), uuid)) => {
-                            let mut write_half = am_write_half.lock().await;
-
-                            println!("am tcp stream is ok!");
-
-                            let tcp_message = TcpMessage {
-                                send_type: "set_uuid".to_string(),
-                                command: ErrorLevel::Ok.to_string(),
-                                uuid: uuid.to_string(),
-                                send_data: Map::new(),
-                                request_data: Map::new()
-                            };
-
-                            send_tcp_message(&mut write_half, tcp_message).await;
-
-                            drop(write_half);
-
-                            (am_read_half, am_write_half, uuid)
-                        },
-                        Err((err, _, mut write_half)) => {
-                            eprintln!("err: {}", err);
-
-                            let tcp_message = TcpMessage {
-                                send_type: "error".to_string(),
-                                command: ErrorLevel::Fatal.to_string(),
-                                uuid: String::new(),
-                                send_data: Map::new(),
-                                request_data: Map::new()
-                            };
-
-                            send_tcp_message(&mut write_half, tcp_message).await;
-
-                            return;
-                        }
-                    };
-
-                    let _ = server_write_clone_0.send(ThreadMessage::Command(ThreadMessageCommand::NewPlayer(uuid)));
-
-                    // 스레드 채널 생성
-                    let (thread_write, thread_read) = unbounded_channel();
-                    // 스레드 채널 추가
-                    thread_write_map_clone_0.insert(uuid, thread_write);
-                    let mut in_tasks = JoinSet::new();
-
-                    in_tasks.spawn(async move { ;
-                        player_handle(am_read_half, am_write_half, uuid, main_thread_write_clone_0, thread_read, buffer, thread_write_map_clone_0).await
-                    });
-
-                    if let Some(res) = in_tasks.join_next().await {
-                        match res {
-                            Ok(result) => match result {
-                                Ok(uuid) => {
-                                    thread_write_map_clone_1.remove(&uuid);
-                                    let _ = server_write_clone_1.send(ThreadMessage::Command(ThreadMessageCommand::EndOfConnect(uuid)));
-                                }
-                                Err((uuid, err)) => {
-                                    thread_write_map_clone_1.remove(&uuid);
-                                    eprintln!("err: {}", err);
-                                }
-                            }
-                            Err(err) => {
-                                eprintln!("task panic!: {}", err);
-                                thread_write_map_clone_1.retain(|_, sender| !sender.is_closed());
-                            }
-                        }
-                    }
+                println!("New connection from {}", addr);
+                spawn(async move {
+                    eprintln!("new connect task spawn");
+                    player_process(stream, addr, server_write_clone, thread_write_map_clone, main_thread_write_clone).await;
                 });
-            },
+            }
             Err(err) => {
                 eprintln!("tcp server err: {}", err);
             }
-        }
-
-        let Some(read) = server_read.recv().await else {
-            continue
         };
 
-        let mut match_queue_2 = MATCH_QUEUE_2.lock().await;
-        let mut match_queue_4 = MATCH_QUEUE_4.lock().await;
-        if match_queue_2.len() >= 2 {
-            let uuid_1 = match_queue_2.remove(0);
-            let uuid_2 = match_queue_2.remove(0);
-            let _ = server_write_clone_2.send(ThreadMessage::Command(ThreadMessageCommand::NewSession2(uuid_1, uuid_2)));
-        }
-
-        if match_queue_4.len() >= 4 {
-            let uuid_1 = match_queue_4.remove(0);
-            let uuid_2 = match_queue_4.remove(0);
-            let uuid_3 = match_queue_4.remove(0);
-            let uuid_4 = match_queue_4.remove(0);
-            let _ = server_write_clone_2.send(ThreadMessage::Command(ThreadMessageCommand::NewSession4(uuid_1, uuid_2, uuid_3, uuid_4)));
-        }
+        yield_now().await;
     }
 }
 
@@ -592,14 +762,12 @@ pub async fn server_loop(mut clients_read: UnboundedReceiver<ThreadMessage>, cli
             continue
         };
 
-
+        println!("유저 스래드에서 메시지 읽음!");
 
         match read {
-            ThreadMessage::Data(data) => {
-                todo!()
-            }
+            ThreadMessage::Data(data) => {}
             ThreadMessage::Command(command) => {
-                match command { 
+                match command {
                     ThreadMessageCommand::NewConnect => println!("new client!"),
                     ThreadMessageCommand::NewPlayer(uuid) => {
                         user_thread_senders.entry(uuid).or_insert_with(|| {
@@ -645,5 +813,7 @@ pub async fn server_loop(mut clients_read: UnboundedReceiver<ThreadMessage>, cli
                 }
             }
         }
+
+        yield_now().await;
     }
 }

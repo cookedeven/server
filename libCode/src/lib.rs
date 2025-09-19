@@ -14,6 +14,7 @@ use tokio::{
 use dashmap::DashMap;
 
 pub const SERVER_IP: &'static str = "127.0.0.1:8080";
+// pub const SERVER_IP: &'static str = "118.40.46.45:8080";
 pub type UserData = Map<String, Value>;
 pub type AM<T> = Arc<Mutex<T>>;
 pub type AD<K, V> = Arc<DashMap<K, V>>;
@@ -55,8 +56,10 @@ pub struct TcpMessage {
     pub request_data: UserData // Map<Uuid, Vec<Value>>
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub enum MessageError {
+    #[default]
+    None,
     NotFound,
     NotLongEnough,
     CommandNotFound,
@@ -225,7 +228,7 @@ impl Display for ErrorLevel {
 }
 
 pub async fn read_data(read_half: &mut OwnedReadHalf, buffer: &mut [u8]) -> Result<TcpMessage, MessageError> {
-    let size = read_half.read(buffer).await.map_err(|e| MessageError::OtherError(e.into()))?;
+    let size = read_half.read(buffer).await.map_err(|e| MessageError::FatalError(e.into()))?;
     if size == 0 {
         return Err(MessageError::ConnectionClosed);
     }

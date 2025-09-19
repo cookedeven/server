@@ -54,7 +54,7 @@ async fn main() {
 
     let mut send_data = Map::new();
     send_data_setting!(send_data,
-        [uuid.clone(), ("matching".to_string(), json!(true))]
+        [uuid.clone(), ("matching_2".to_string(), json!(true))]
     );
 
     let message = TcpMessage {
@@ -74,9 +74,13 @@ async fn main() {
         [uuid.clone(), ("matching".to_string(), json!(false))]
     );
 
-    loop {
+    let tcp_message = read_data(&mut read, &mut buffer).await.unwrap();
 
-    }
+    println!("read: {:?}", tcp_message);
+
+    let names: Vec<_> = tcp_message.send_data.iter().map(|(key, value)| value.get("name").unwrap().as_str().unwrap()).collect();
+
+    println!("name: {:?}", names);
 
     /*
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
