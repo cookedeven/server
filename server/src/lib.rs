@@ -349,68 +349,7 @@ async fn message_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<Owned
     (first_result, second_result)
 }
 
-async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedWriteHalf>, uuid: Uuid, main_write: UnboundedSender<ThreadMessage>, thread_read: UnboundedReceiver<ThreadMessage>, mut buffer: Vec<u8>, user_senders: AD<Uuid, UnboundedSender<ThreadMessage>>) -> Result<Uuid, (Uuid, MessageError)> {
-    println!("new player! uuid: {}", uuid);
-    
-    let mut read_half = am_read_half.lock().await;
-
-    let name = match name_check(&mut read_half, uuid, &mut buffer).await {
-        Ok(name) => {
-            println!("setting name: {}", name);
-            let mut send_data = Map::new();
-            send_data_setting!(send_data,
-                [uuid.to_string(), ("name".to_string(), json!(name))]
-            );
-            
-            let tcp_message = TcpMessage {
-                send_type: "name_set".to_string(),
-                command: ErrorLevel::Ok.to_string(),
-                uuid: uuid.to_string(),
-                send_data,
-                request_data: Map::new()
-            };
-            
-            let mut write_half = am_write_half.lock().await;
-            send_tcp_message(&mut write_half, tcp_message).await;
-            
-            name
-        },
-        Err(err) => {
-            eprintln!("err: {}", err);
-            
-            let mut send_data = Map::new();
-            let mut request_data = Map::new();
-            send_data_setting!(send_data,
-                [uuid.to_string(), ("error".to_string(), json!("can not setting name"))]
-            );
-            request_data_setting!(request_data,
-                [uuid.to_string(), "name".to_string()]
-            );
-            
-            let tcp_message = TcpMessage {
-                send_type: "error".to_string(),
-                command: ErrorLevel::Warning.to_string(),
-                uuid: uuid.to_string(),
-                send_data,
-                request_data
-            };
-            
-            let mut write_half = am_write_half.lock().await;
-            send_tcp_message(&mut write_half, tcp_message).await;
-
-            "ERRORRRRRRRRRRRRRRRRRRRRRRRRRRRR".to_string()
-        }
-    };
-
-    let mut user_data = USER_DATA.clone();
-    let dash_map_name = HashMap::from([
-        ("name".to_string(), json!(name)),
-    ]).into_iter().collect();
-
-    user_data.insert(uuid, Arc::new(dash_map_name));
-
-    drop(read_half);
-
+async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedWriteHalf>, uuid: Uuid, name: Name, main_write: UnboundedSender<ThreadMessage>, thread_read: UnboundedReceiver<ThreadMessage>, mut buffer: Vec<u8>, user_senders: AD<Uuid, UnboundedSender<ThreadMessage>>) -> Result<Uuid, (Uuid, MessageError)> {
     let write_half_clone_0 = am_write_half.clone();
     let write_half_clone_1 = am_write_half.clone();
     let read_half_clone_0 = am_read_half.clone();
@@ -419,16 +358,17 @@ async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedW
     let state_clone_0 = am_state.clone();
     let state_clone_1 = am_state.clone();
     let mut tasks = JoinSet::new();
-    let tasks_sender = am!(Vec::new());
-    let tasks_sender_clone = tasks_sender.clone();
+    let am_tasks_sender = am!(Vec::new());
+    let tasks_sender_clone = am_tasks_sender.clone();
     let (sender, mut receiver) = unbounded_channel();
     let tcp_thread_senders = USER_UNBOUNDED_SENDERS.clone();
     tcp_thread_senders.insert(uuid, sender.clone());
 
     tasks.spawn(async move {
         println!("thread spawned");
-        tasks_sender_clone.lock().await.push(sender);
-        drop(tasks_sender_clone);
+        let mut tasks_sender = tasks_sender_clone.lock().await;
+        tasks_sender.push(sender);
+        drop(tasks_sender);
         loop {
             let write_half = write_half_clone_0.clone();
             let read_half = read_half_clone_0.clone();
@@ -599,36 +539,92 @@ async fn player_process(stream: TcpStream, addr: SocketAddr, server_write: Unbou
 
     let _ = server_write.send(ThreadMessage::Command(ThreadMessageCommand::NewPlayer(uuid)));
 
+    println!("new player! uuid: {}", uuid);
+
+    let mut read_half = am_read_half.lock().await;
+
+    let name = match name_check(&mut read_half, uuid, &mut buffer).await {
+        Ok(name) => {
+            println!("setting name: {}", name);
+            let mut send_data = Map::new();
+            send_data_setting!(send_data,
+                [uuid.to_string(), ("name".to_string(), json!(name))]
+            );
+
+            let tcp_message = TcpMessage {
+                send_type: "name_set".to_string(),
+                command: ErrorLevel::Ok.to_string(),
+                uuid: uuid.to_string(),
+                send_data,
+                request_data: Map::new()
+            };
+
+            let mut write_half = am_write_half.lock().await;
+            send_tcp_message(&mut write_half, tcp_message).await;
+
+            name
+        },
+        Err(err) => {
+            eprintln!("err: {}", err);
+
+            let mut send_data = Map::new();
+            let mut request_data = Map::new();
+            send_data_setting!(send_data,
+                [uuid.to_string(), ("error".to_string(), json!("can not setting name"))]
+            );
+            request_data_setting!(request_data,
+                [uuid.to_string(), "name".to_string()]
+            );
+
+            let tcp_message = TcpMessage {
+                send_type: "error".to_string(),
+                command: ErrorLevel::Warning.to_string(),
+                uuid: uuid.to_string(),
+                send_data,
+                request_data
+            };
+
+            let mut write_half = am_write_half.lock().await;
+            send_tcp_message(&mut write_half, tcp_message).await;
+
+            "ERRORRRRRRRRRRRRRRRRRRRRRRRRRRRR".to_string()
+        }
+    };
+
+    drop(read_half);
+
+    let user_data = USER_DATA.clone();
+    let dash_map_name = HashMap::from([
+        ("name".to_string(), json!(name)),
+    ]).into_iter().collect();
+
+    user_data.insert(uuid, Arc::new(dash_map_name));
+
     // 스레드 채널 생성
     let (thread_write, thread_read) = unbounded_channel();
     // 스레드 채널 추가
     thread_write_map.insert(uuid, thread_write);
-    let mut tasks = JoinSet::new();
     let thread_write_map_clone = thread_write_map.clone();
-    tasks.spawn(async move {
-        player_handle(am_read_half, am_write_half, uuid, main_thread_write, thread_read, buffer, thread_write_map_clone).await
+    let tasks = spawn(async move {
+        player_handle(am_read_half, am_write_half, uuid, name, main_thread_write, thread_read, buffer, thread_write_map_clone).await
     });
 
-    if let Some(res) = tasks.join_next().await {
-        println!("task 정상 종료!");
-        match res {
-            Ok(result) => match result {
-                Ok(uuid) => {
-                    thread_write_map.remove(&uuid);
-                    let _ = server_write.send(ThreadMessage::Command(ThreadMessageCommand::EndOfConnect(uuid)));
-                }
-                Err((uuid, err)) => {
-                    thread_write_map.remove(&uuid);
-                    eprintln!("err: {}", err);
-                }
+    println!("task 종료!");
+    match tasks.await {
+        Ok(result) => match result {
+            Ok(uuid) => {
+                thread_write_map.remove(&uuid);
+                let _ = server_write.send(ThreadMessage::Command(ThreadMessageCommand::EndOfConnect(uuid)));
             }
-            Err(err) => {
-                eprintln!("task panic!: {}", err);
-                thread_write_map.retain(|_, sender| !sender.is_closed());
+            Err((uuid, err)) => {
+                thread_write_map.remove(&uuid);
+                eprintln!("err: {}", err);
             }
         }
-    } else {
-        println!("task panic!");
+        Err(err) => {
+            eprintln!("task panic!: {}", err);
+            thread_write_map.retain(|_, sender| !sender.is_closed());
+        }
     }
 }
 
