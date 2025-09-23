@@ -1,10 +1,9 @@
 use std::{
-    thread,
     str::FromStr,
     sync::Arc,
+    collections::HashMap,
+    net::SocketAddr
 };
-use std::collections::HashMap;
-use std::net::SocketAddr;
 use tokio::{
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -16,19 +15,13 @@ use tokio::{
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
         Mutex,
     },
-    task::JoinSet,
-    time::sleep,
+    task::{JoinSet, yield_now},
 };
 use uuid::Uuid;
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use serde_json::{json, Map, Value};
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use tokio::io::WriteHalf;
-use tokio::task::yield_now;
-// use libCode::{ErrorLevel, MatchingState, MessageError, SERVER_IP, TcpMessage, UserData};
-use libCode::*;
-
+use lib_code::{ErrorLevel, MatchingState, MessageError, SERVER_IP, TcpMessage, UserData, AD, AM, send_data_setting, request_data_setting, send_tcp_message, read_data};
 
 pub type Name = String;
 pub type PlayerData = AD<Uuid, AD<String, Value>>;
@@ -671,15 +664,7 @@ async fn session_manager_4(session_id: SessionID, session_read: UnboundedReceive
 
 pub async fn player_tcp_handle(mut server_read: UnboundedReceiver<ThreadMessage>, server_write: UnboundedSender<ThreadMessage>) {
     let server_addr = SocketAddr::from_str(SERVER_IP).expect("Could not parse server IP");
-
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("Could not create socket");
-
-    socket.set_reuse_address(true).expect("Could not reuse TCP");
-
-    socket.bind(&server_addr.into()).expect("Could not bind server");
-    socket.listen(128).expect("Could not listen");
-
-    let listener = TcpListener::from_std(socket.into()).expect("Could not create listener");
+    let listener = TcpListener::bind(server_addr).await.expect("Could not bind server socket");
     println!("Server listening on {}", SERVER_IP);
 
     let (main_thread_write, mut main_thread_read) = unbounded_channel();

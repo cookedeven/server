@@ -14,7 +14,6 @@ use tokio::{
 use dashmap::DashMap;
 
 pub const SERVER_IP: &'static str = "127.0.0.1:8080";
-// pub const SERVER_IP: &'static str = "118.40.46.45:8080";
 pub type UserData = Map<String, Value>;
 pub type AM<T> = Arc<Mutex<T>>;
 pub type AD<K, V> = Arc<DashMap<K, V>>;

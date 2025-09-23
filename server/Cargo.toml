@@ -7,8 +7,7 @@ edition = "2021"
 tokio = { version = "1.44.1", features = ["rt", "rt-multi-thread", "macros", "net", "io-std", "io-util", "sync", "time", "tracing"] }
 uuid = { version = "1.16.0", features = ["v4"] }
 lazy_static = "1.5.0"
-libCode = { path = "../libCode"}
+lib_code = { path = "../lib_code" }
 serde_json = "1.0"
 dashmap = "6.1.0"
-socket2 = "0.6.0"
 console-subscriber = "0.4.1"
