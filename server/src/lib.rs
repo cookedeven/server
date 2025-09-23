@@ -473,22 +473,22 @@ async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedW
             Ok(task_result) => {
                 match task_result {
                     Ok(()) => {
-                        end_of_tasks!(tasks_sender);
+                        end_of_tasks!(am_tasks_sender);
                         Ok(uuid)
                     },
                     Err(error) => {
-                        end_of_tasks!(tasks_sender);
+                        end_of_tasks!(am_tasks_sender);
                         Err((uuid, error))
                     },
                 }
             },
             Err(err) => {
-                end_of_tasks!(tasks_sender);
+                end_of_tasks!(am_tasks_sender);
                 Err((uuid, MessageError::OtherError(err.into())))
             }
         }
     } else {
-        end_of_tasks!(tasks_sender);
+        end_of_tasks!(am_tasks_sender);
         Err((uuid, MessageError::UndefinedError))
     }
 }
