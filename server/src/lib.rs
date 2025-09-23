@@ -662,9 +662,9 @@ async fn session_manager_4(session_id: SessionID, session_read: UnboundedReceive
     
 }
 
-pub async fn player_tcp_handle(mut server_read: UnboundedReceiver<ThreadMessage>, server_write: UnboundedSender<ThreadMessage>) {
-    let server_addr = SocketAddr::from_str(SERVER_IP).expect("Could not parse server IP");
-    let listener = TcpListener::bind(server_addr).await.expect("Could not bind server socket");
+pub async fn player_tcp_handle(mut server_read: UnboundedReceiver<ThreadMessage>, server_write: UnboundedSender<ThreadMessage>) -> Result<(), MessageError> {
+    let server_addr = SocketAddr::from_str(SERVER_IP)?;
+    let listener = TcpListener::bind(server_addr).await?;
     println!("Server listening on {}", SERVER_IP);
 
     let (main_thread_write, mut main_thread_read) = unbounded_channel();

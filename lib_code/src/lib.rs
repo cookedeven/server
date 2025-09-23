@@ -3,7 +3,9 @@ use std::{
     fmt::{Display, Formatter},
     str::{self, FromStr},
     sync::Arc,
+    net::SocketAddr,
 };
+use std::net::AddrParseError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, to_vec, Map, Value};
 use tokio::{
@@ -145,6 +147,12 @@ impl From<std::io::Error> for MessageError {
 
 impl From<uuid::Error> for MessageError {
     fn from(value: uuid::Error) -> Self {
+        MessageError::OtherError(value.into())
+    }
+}
+
+impl From<AddrParseError> for MessageError {
+    fn from(value: AddrParseError) -> Self {
         MessageError::OtherError(value.into())
     }
 }
