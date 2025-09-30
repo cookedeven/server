@@ -1,11 +1,10 @@
 use std::{
-    error::Error,
+    error::Error as StdError,
     fmt::{Display, Formatter},
     str::{self, FromStr},
     sync::Arc,
-    net::SocketAddr,
+    net::AddrParseError,
 };
-use std::net::AddrParseError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, to_vec, Map, Value};
 use tokio::{
@@ -21,8 +20,22 @@ pub type AM<T> = Arc<Mutex<T>>;
 pub type AD<K, V> = Arc<DashMap<K, V>>;
 
 #[macro_export]
+macro_rules! am {
+    ($t:expr) => {
+        Arc::new(Mutex::new($t))
+    };
+}
+
+#[macro_export]
+macro_rules! ad {
+    () => {
+        Arc::new(DashMap::new())
+    };
+}
+
+#[macro_export]
 macro_rules! send_data_setting {
-    ($data:ident, $([$uuid:expr $(, ($key:expr, $value:expr))*]),* $(,)?) => {
+    ($data:ident, $([$uuid:expr $(, ($key:expr, $value:expr))+]),+) => {
         $(
             let mut buffer = Map::new();
 
@@ -36,7 +49,7 @@ macro_rules! send_data_setting {
 
 #[macro_export]
 macro_rules! request_data_setting {
-    ($request_data:ident, $([$uuid:expr $(, $value:expr)*]),* $(,)?) => {
+    ($request_data:ident, $([$uuid:expr $(, $value:expr)+]),+) => {
         $(
             let mut buffer = Vec::new();
 
@@ -57,8 +70,50 @@ pub struct TcpMessage {
     pub request_data: UserData // Map<Uuid, Vec<Value>>
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Default)]
+enum ErrorKind {
+    #[default]
+    None,
+    NotFound,
+    NotLongEnough,
+    CommandNotFound,
+    CommunicationError,
+    UndefinedError,
+    TooLong,
+    EmptyCommand,
+    InvalidUUID,
+    MissingUUID,
+    ParseError,
+    ConnectionClosed,
+    InvalidType,
+    InvalidUtf8,
+    DeserializeError,
+    SerializeError,
+    OtherError,
+    FatalError,
+    Errors,
+}
+
+impl Display for ErrorKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
 #[derive(Debug, Default)]
-pub enum MessageError {
+pub struct E {
+    pub error_kind: ErrorKind,
+    pub error: Option<Box<dyn StdError + Send + Sync>>,
+}
+
+impl Display for E {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "error kind: {}, error: {:?}", self.error_kind, self.error)
+    }
+}
+
+#[derive(Debug, Default)]
+pub enum Error {
     #[default]
     None,
     NotFound,
@@ -76,40 +131,40 @@ pub enum MessageError {
     InvalidUtf8(std::str::Utf8Error),
     DeserializeError(serde_json::Error),
     Errors(Vec<Self>),
-    OtherError(Box<dyn Error + Send + Sync>),
-    FatalError(Box<dyn Error + Send + Sync>)
+    OtherError(Box<dyn StdError + Send + Sync>),
+    FatalError(Box<dyn StdError + Send + Sync>)
 }
 
-impl MessageError {
+impl Error {
     pub fn unrecoverable_error(&self) -> bool {
         match self {
-            MessageError::NotFound => false,
-            MessageError::NotLongEnough => false,
-            MessageError::CommandNotFound => false,
-            MessageError::CommunicationError => false,
-            MessageError::UndefinedError => true,
-            MessageError::TooLong => false,
-            MessageError::EmptyCommand => false,
-            MessageError::InvalidUUID => false,
-            MessageError::MissingUUID => true,
-            MessageError::ParseError => false,
-            MessageError::ConnectionClosed => true,
-            MessageError::InvalidType => false,
-            MessageError::InvalidUtf8(_) => false,
-            MessageError::DeserializeError(_) => false,
-            MessageError::Errors(errors) => {
+            Error::NotFound => false,
+            Error::NotLongEnough => false,
+            Error::CommandNotFound => false,
+            Error::CommunicationError => false,
+            Error::UndefinedError => true,
+            Error::TooLong => false,
+            Error::EmptyCommand => false,
+            Error::InvalidUUID => false,
+            Error::MissingUUID => true,
+            Error::ParseError => false,
+            Error::ConnectionClosed => true,
+            Error::InvalidType => false,
+            Error::InvalidUtf8(_) => false,
+            Error::DeserializeError(_) => false,
+            Error::Errors(errors) => {
                 errors.iter().any(|e| e.unrecoverable_error())
             }
-            MessageError::OtherError(_) => false,
-            MessageError::FatalError(_) => true,
+            Error::OtherError(_) => false,
+            Error::FatalError(_) => true,
             _ => false
         }
     }
 }
 
-impl Error for MessageError {}
+impl StdError for Error {}
 
-impl Display for MessageError {
+impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => write!(f, "message not found"),
@@ -139,21 +194,21 @@ impl Display for MessageError {
     }
 }
 
-impl From<std::io::Error> for MessageError {
+impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
-        MessageError::OtherError(Box::new(value))
+        Error::OtherError(Box::new(value))
     }
 }
 
-impl From<uuid::Error> for MessageError {
+impl From<uuid::Error> for Error {
     fn from(value: uuid::Error) -> Self {
-        MessageError::OtherError(value.into())
+        Error::OtherError(value.into())
     }
 }
 
-impl From<AddrParseError> for MessageError {
+impl From<AddrParseError> for Error {
     fn from(value: AddrParseError) -> Self {
-        MessageError::OtherError(value.into())
+        Error::OtherError(value.into())
     }
 }
 
@@ -174,7 +229,7 @@ pub enum MatchingState {
 }
 
 impl FromStr for MatchingState {
-    type Err = MessageError;
+    type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
@@ -183,7 +238,7 @@ impl FromStr for MatchingState {
             "wait" => Ok(Self::Wait),
             "play_wait" => Ok(Self::PlayWait),
             "playing" => Ok(Self::Playing),
-            _ => Err(MessageError::NotFound)
+            _ => Err(Error::NotFound)
         }
     }
 }
@@ -210,14 +265,14 @@ pub enum ErrorLevel {
 }
 
 impl FromStr for ErrorLevel {
-    type Err = MessageError;
+    type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "fatal" => Ok(Self::Fatal),
             "warning" => Ok(Self::Warning),
             "ok" => Ok(Self::Ok),
-            _ => Err(MessageError::NotFound)
+            _ => Err(Error::NotFound)
         }
     }
 }
@@ -234,18 +289,18 @@ impl Display for ErrorLevel {
     }
 }
 
-pub async fn read_data(read_half: &mut OwnedReadHalf, buffer: &mut [u8]) -> Result<TcpMessage, MessageError> {
-    let size = read_half.read(buffer).await.map_err(|e| MessageError::FatalError(e.into()))?;
+pub async fn read_data(read_half: &mut OwnedReadHalf, buffer: &mut [u8]) -> Result<TcpMessage, Error> {
+    let size= read_half.read(buffer).await.map_err(|e| Error::FatalError(e.into()))?;
     if size == 0 {
-        return Err(MessageError::ConnectionClosed);
+        return Err(Error::ConnectionClosed);
     }
 
     let message_bytes = &buffer[..size];
-    let string_message = str::from_utf8(message_bytes).map_err(|e| MessageError::InvalidUtf8(e))?;
+    let string_message = str::from_utf8(message_bytes).map_err(|e| Error::InvalidUtf8(e))?;
 
     println!("string_message: {}", string_message);
 
-    let tcp_message: TcpMessage = serde_json::from_str(string_message).map_err(|e| MessageError::DeserializeError(e))?;
+    let tcp_message: TcpMessage = serde_json::from_str(string_message).map_err(|e| Error::DeserializeError(e))?;
 
     println!("parse data: {:?}", tcp_message);
 

@@ -21,25 +21,11 @@ use uuid::Uuid;
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use serde_json::{json, Map, Value};
-use lib_code::{ErrorLevel, MatchingState, MessageError, SERVER_IP, TcpMessage, UserData, AD, AM, send_data_setting, request_data_setting, send_tcp_message, read_data};
+use lib_code::{ErrorLevel, MatchingState, Error, SERVER_IP, TcpMessage, UserData, AD, AM, send_data_setting, request_data_setting, send_tcp_message, read_data, am, ad};
 
 pub type Name = String;
 pub type PlayerData = AD<Uuid, AD<String, Value>>;
 pub type SessionID = i64;
-
-#[macro_export]
-macro_rules! am {
-    ($t:expr) => {
-        Arc::new(Mutex::new($t))
-    };
-}
-
-#[macro_export]
-macro_rules! ad {
-    () => {
-        Arc::new(DashMap::new())
-    };
-}
 
 macro_rules! end_of_tasks {
     ($arc_mutex_vec_unbounded_sender_thread_message:expr) => {
@@ -142,7 +128,7 @@ fn name_get(player_data: &PlayerData, get_uuid: Uuid, uuid: Uuid, write_half: &m
     })
 }
 
-async fn uuid_check(tcp_stream: TcpStream, buffer: &mut [u8]) -> Result<((AM<OwnedReadHalf>, AM<OwnedWriteHalf>), Uuid), (MessageError, OwnedReadHalf, OwnedWriteHalf)> {
+async fn uuid_check(tcp_stream: TcpStream, buffer: &mut [u8]) -> Result<((AM<OwnedReadHalf>, AM<OwnedWriteHalf>), Uuid), (Error, OwnedReadHalf, OwnedWriteHalf)> {
     let (mut read_half, write_half) = tcp_stream.into_split();
     
     let tcp_message = match read_data(&mut read_half, buffer).await {
@@ -151,7 +137,7 @@ async fn uuid_check(tcp_stream: TcpStream, buffer: &mut [u8]) -> Result<((AM<Own
     };
 
     if &tcp_message.send_type != "uuid" {
-        return Err((MessageError::NotFound, read_half, write_half))
+        return Err((Error::NotFound, read_half, write_half))
     }
 
     match tcp_message.command.as_str() {
@@ -165,37 +151,37 @@ async fn uuid_check(tcp_stream: TcpStream, buffer: &mut [u8]) -> Result<((AM<Own
         "check" => {
             let uuid = match Uuid::from_str(&tcp_message.uuid) {
                 Ok(uuid) => uuid,
-                Err(_) => return Err((MessageError::InvalidUUID, read_half, write_half)),
+                Err(_) => return Err((Error::InvalidUUID, read_half, write_half)),
             };
             let player_table = &PLAYER_TABLE;
             match player_table.get(&uuid) {
                 Some(stream) => Ok((stream.clone(), uuid)),
-                None => Err((MessageError::NotFound, read_half, write_half))
+                None => Err((Error::NotFound, read_half, write_half))
             }
         }
-        _ => Err((MessageError::CommandNotFound, read_half, write_half))
+        _ => Err((Error::CommandNotFound, read_half, write_half))
     }
 }
 
-async fn name_check(read_half: &mut OwnedReadHalf, uuid: Uuid, buffer: &mut [u8]) -> Result<Name, MessageError> {
+async fn name_check(read_half: &mut OwnedReadHalf, uuid: Uuid, buffer: &mut [u8]) -> Result<Name, Error> {
     let tcp_message = match read_data(read_half, buffer).await {
         Ok(tcp_message) => tcp_message,
         Err(err) => return Err(err)
     };
 
     if tcp_message.send_type != "name" {
-        return Err(MessageError::CommandNotFound);
+        return Err(Error::CommandNotFound);
     }
 
-    let data_value = tcp_message.send_data.get(&uuid.to_string()).ok_or_else(|| MessageError::NotFound)?;
-    let data = data_value.as_object().ok_or_else(|| MessageError::InvalidType)?;
-    let name_value = data.get("name").ok_or_else(|| MessageError::NotFound)?;
-    let name = name_value.as_str().ok_or_else(|| MessageError::InvalidType)?;
+    let data_value = tcp_message.send_data.get(&uuid.to_string()).ok_or_else(|| Error::NotFound)?;
+    let data = data_value.as_object().ok_or_else(|| Error::InvalidType)?;
+    let name_value = data.get("name").ok_or_else(|| Error::NotFound)?;
+    let name = name_value.as_str().ok_or_else(|| Error::InvalidType)?;
 
     Ok(name.to_string())
 }
 
-fn send_data_handle(send_data: UserData, uuid: &Uuid, name: &Name, state: &mut UserState) -> Vec<Result<MessageCommand, MessageError>> {
+fn send_data_handle(send_data: UserData, uuid: &Uuid, name: &Name, state: &mut UserState) -> Vec<Result<MessageCommand, Error>> {
     if send_data.is_empty() {
         return Vec::new()
     }
@@ -210,7 +196,7 @@ fn send_data_handle(send_data: UserData, uuid: &Uuid, name: &Name, state: &mut U
         let data = match data_value.as_object() {
             Some(data) => data,
             None => {
-                result.push(Err(MessageError::InvalidType));
+                result.push(Err(Error::InvalidType));
                 continue
             }
         };
@@ -224,7 +210,7 @@ fn send_data_handle(send_data: UserData, uuid: &Uuid, name: &Name, state: &mut U
                         let match_state = match value.as_bool() {
                             Some(match_state) => match_state,
                             None => {
-                                result.push(Err(MessageError::InvalidType));
+                                result.push(Err(Error::InvalidType));
                                 continue
                             }
                         };
@@ -251,7 +237,7 @@ fn send_data_handle(send_data: UserData, uuid: &Uuid, name: &Name, state: &mut U
     result
 }
 
-fn request_data_handle(request_data: UserData, uuid: &Uuid, name: &Name, state: &mut UserState) -> Vec<Result<MessageCommand, MessageError> >{
+fn request_data_handle(request_data: UserData, uuid: &Uuid, name: &Name, state: &mut UserState) -> Vec<Result<MessageCommand, Error> >{
     if request_data.is_empty() {
         return Vec::new()
     }
@@ -272,14 +258,14 @@ fn request_data_handle(request_data: UserData, uuid: &Uuid, name: &Name, state: 
 
                 result.push(Ok(MessageCommand::SendTcpMessage(message)));
             }
-            _ => result.push(Err(MessageError::InvalidType))
+            _ => result.push(Err(Error::InvalidType))
         }
     }
     
     result
 }
 
-async fn message_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedWriteHalf>, uuid: Uuid, name: &Name, am_state: AM<UserState>, buffer: &mut [u8], user_sender: AD<Uuid, UnboundedSender<ThreadMessage>>) -> (Result<(), MessageError>, Result<(), Vec<MessageError>>) {
+async fn message_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedWriteHalf>, uuid: Uuid, name: &Name, am_state: AM<UserState>, buffer: &mut [u8], user_sender: AD<Uuid, UnboundedSender<ThreadMessage>>) -> (Result<(), Error>, Result<(), Vec<Error>>) {
     let mut read_half = am_read_half.lock().await;
     let tcp_message = match read_data(&mut read_half, buffer).await {
         Ok(tcp_message) => tcp_message,
@@ -288,7 +274,7 @@ async fn message_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<Owned
     drop(read_half);
 
     if tcp_message.send_type.as_str() != "connect" {
-        return (Err(MessageError::CommandNotFound), Err(Vec::new()));
+        return (Err(Error::CommandNotFound), Err(Vec::new()));
     }
 
     let mut state = am_state.lock().await;
@@ -349,7 +335,7 @@ async fn message_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<Owned
     (first_result, second_result)
 }
 
-async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedWriteHalf>, uuid: Uuid, name: Name, main_write: UnboundedSender<ThreadMessage>, thread_read: UnboundedReceiver<ThreadMessage>, mut buffer: Vec<u8>, user_senders: AD<Uuid, UnboundedSender<ThreadMessage>>) -> Result<Uuid, (Uuid, MessageError)> {
+async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedWriteHalf>, uuid: Uuid, name: Name, main_write: UnboundedSender<ThreadMessage>, thread_read: UnboundedReceiver<ThreadMessage>, mut buffer: Vec<u8>, user_senders: AD<Uuid, UnboundedSender<ThreadMessage>>) -> Result<Uuid, (Uuid, Error)> {
     let write_half_clone_0 = am_write_half.clone();
     let write_half_clone_1 = am_write_half.clone();
     let read_half_clone_0 = am_read_half.clone();
@@ -380,7 +366,7 @@ async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedW
             if let Err(error) = send_data_result {
                if error.unrecoverable_error() {
                    println!("읽기 종료!");
-                   return Err(MessageError::OtherError(error.into()));
+                   return Err(Error::OtherError(error.into()));
                }
             }
 
@@ -388,7 +374,7 @@ async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedW
                for err in error {
                    if err.unrecoverable_error() {
                        println!("읽기 종료!");
-                       return Err(MessageError::OtherError(err.into()));
+                       return Err(Error::OtherError(err.into()));
                    }
                }
             }
@@ -401,7 +387,7 @@ async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedW
         loop {
             println!("플레이어 헨들 읽기 준비! uuid: {}", uuid);
             let Some(message) = receiver.recv().await else {
-                return Err(MessageError::ConnectionClosed)
+                return Err(Error::ConnectionClosed)
             };
 
             println!("플레이어 헨들에서 메시지 읽음! uuid: {}", uuid);
@@ -414,7 +400,7 @@ async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedW
                         state.matching_state_2 == MatchingState::Playing;
                         let session_senders = SERVER_UNBOUNDED_SENDERS.clone();
                         let Some(session_sender) = session_senders.get(&session_id) else {
-                            return Err(MessageError::NotFound)
+                            return Err(Error::NotFound)
                         };
 
                     } else {
@@ -484,12 +470,12 @@ async fn player_handle(am_read_half: AM<OwnedReadHalf>, am_write_half: AM<OwnedW
             },
             Err(err) => {
                 end_of_tasks!(am_tasks_sender);
-                Err((uuid, MessageError::OtherError(err.into())))
+                Err((uuid, Error::OtherError(err.into())))
             }
         }
     } else {
         end_of_tasks!(am_tasks_sender);
-        Err((uuid, MessageError::UndefinedError))
+        Err((uuid, Error::UndefinedError))
     }
 }
 
@@ -632,16 +618,16 @@ async fn user_manager(mut thread_read: UnboundedReceiver<ThreadMessage>, main_wr
     
 }
 
-async fn session_manager_2(session_id: SessionID, session_read: UnboundedReceiver<ThreadMessage>, main_write: UnboundedSender<ThreadMessage>, thread_senders: Arc<DashMap<Uuid, UnboundedSender<ThreadMessage>>>, uuid_1: Uuid, uuid_2: Uuid) -> Result<(), MessageError> {
+async fn session_manager_2(session_id: SessionID, session_read: UnboundedReceiver<ThreadMessage>, main_write: UnboundedSender<ThreadMessage>, thread_senders: Arc<DashMap<Uuid, UnboundedSender<ThreadMessage>>>, uuid_1: Uuid, uuid_2: Uuid) -> Result<(), Error> {
     println!("세션 생성! id: {}, player_1_uuid: {}, player_2_uuid: {}", session_id, uuid_1, uuid_2);
 
     let user_senders = USER_UNBOUNDED_SENDERS.clone();
     let Some(user_1_sender) = user_senders.get(&uuid_1) else {
-        return Err(MessageError::NotFound);
+        return Err(Error::NotFound);
     };
 
     let Some(user_2_sender) = user_senders.get(&uuid_2) else {
-        return Err(MessageError::NotFound);
+        return Err(Error::NotFound);
     };
 
     println!("유저 핸들에 메시지 보냄!");
@@ -658,7 +644,7 @@ async fn session_manager_4(session_id: SessionID, session_read: UnboundedReceive
     
 }
 
-pub async fn player_tcp_handle(mut server_read: UnboundedReceiver<ThreadMessage>, server_write: UnboundedSender<ThreadMessage>) -> Result<(), MessageError> {
+pub async fn player_tcp_handle(mut server_read: UnboundedReceiver<ThreadMessage>, server_write: UnboundedSender<ThreadMessage>) -> Result<(), Error> {
     let server_addr = SocketAddr::from_str(SERVER_IP)?;
     let listener = TcpListener::bind(server_addr).await?;
     println!("Server listening on {}", SERVER_IP);
