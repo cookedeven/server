@@ -67,7 +67,7 @@ pub struct TcpMessage {
     pub command: String,
     pub uuid: String,
     pub send_data: UserData, // Map<Uuid, Map<DataName, Value>>
-    pub request_data: UserData // Map<Uuid, Vec<Value>>
+    pub request_data: UserData // Map<Uuid, Vec<DataName>>
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Default)]
